@@ -133,8 +133,8 @@ func (d *DB) MarkStarted(taskID, logPath string) error {
 }
 
 // MarkFinished settles a task into done/failed/canceled. result is the
-// task's saved output — the model reply for llm tasks, the captured
-// stdout+stderr for exec tasks — queryable with `forebay results`.
+// task's saved output: the model reply for llm tasks, the captured
+// stdout+stderr for exec tasks.
 func (d *DB) MarkFinished(taskID, status string, exitCode int, errMsg, result string) error {
 	_, err := d.Exec(`UPDATE tasks SET status = ?, finished_at = ?, exit_code = ?, error = ?,
 		result = ? WHERE id = ?`, status, now(), exitCode, errMsg, result, taskID)
@@ -380,8 +380,7 @@ func (d *DB) Results(f ResultFilter) ([]Task, error) {
 	return out, rows.Err()
 }
 
-// escapeLike neutralizes SQL LIKE wildcards so a search string matches
-// literally (paired with ESCAPE '\').
+// escapeLike neutralizes SQL LIKE wildcards, paired with ESCAPE '\'.
 func escapeLike(s string) string {
 	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 	return r.Replace(s)

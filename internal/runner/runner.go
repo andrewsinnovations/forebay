@@ -204,7 +204,6 @@ func executeTask(ctx context.Context, db *store.DB, task *store.Task, tee bool) 
 			if cancel {
 				killTree(cmd, tree, waitCh)
 				logFile.Sync()
-				// Partial output is still worth keeping on a cancel.
 				db.MarkFinished(task.ID, store.StatusCanceled, -1, "canceled by user",
 					captureResult(logPath, resultLimit()))
 				fmt.Printf("[%s/%s] canceled\n", batch.Name, task.ID)

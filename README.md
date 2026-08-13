@@ -120,6 +120,23 @@ none) and is stored in plaintext, so keep the file private.
 `timeout_seconds` (default 300) and per-task `--model` overrides are
 also supported.
 
+`extra_body` merges arbitrary fields into every request, for parameters
+forebay doesn't model itself — sampling settings, or whatever the
+endpoint you point at happens to accept:
+
+```json
+{
+  "base_url": "https://api.openai.com/v1",
+  "model": "gpt-4o-mini",
+  "extra_body": { "temperature": 0, "seed": 42 }
+}
+```
+
+forebay doesn't interpret these; they are passed through verbatim, so
+only send fields your endpoint accepts — strict APIs reject unknown
+ones. `extra_body` cannot set `model`, `messages`, or `response_format`,
+which forebay derives per task; a config that tries is rejected.
+
 ```sh
 # One call
 forebay add-llm --system "You are terse." -- "Summarize the plot of Hamlet."
@@ -141,9 +158,48 @@ forebay results --batch jssum --json   # machine-readable (see "Results")
 `response_format: json_schema` with `strict: true`), and the user
 prompt comes after `--`. In `batch-llm`, both prompts take the same
 per-file placeholders as `forebay batch`. Each reply is saved on the
-task (shown by `forebay results`); the raw API response goes to the
-task log for debugging. Failed calls record the HTTP error — retry them
-with `forebay reset --failed && forebay run`.
+task (shown by `forebay results`); the full request and response go to
+the task log for debugging. Failed calls record the HTTP error — retry
+them with `forebay reset --failed && forebay run`.
+
+**Flags go before `--`.** Everything after the separator is prompt text,
+so `add-llm -- "summarize" --schema-file s.json` would send the flag to
+the model rather than applying it. forebay rejects that at queue time,
+and confirms on every queue whether a schema was attached:
+
+```
+queued llm task 6223b167 on batch "jssum" — structured output (json_schema, strict)
+queued llm task 9d5bf81c on batch "default" — free-form text (no --schema/--schema-file)
+```
+
+If a schema was sent but the reply comes back as prose, the task fails
+with that reason instead of silently saving text. Check `forebay logs
+TASK_ID`: the request body it prints is exactly what forebay POSTed,
+`response_format` included, followed by the raw response.
+
+Two things routinely swallow a schema, and neither is forebay:
+
+- **Gateways drop unsupported parameters silently.** A router that picks
+  the model for you may forward `response_format` to models that support
+  structured outputs and quietly discard it for those that don't, so the
+  same command honors the schema one run and returns prose the next. Pin
+  a model known to support structured outputs (`--model`, or `"model"` in
+  the config) rather than an auto-routing alias. If your gateway has an
+  opt-in for strict parameter handling, pass it via `extra_body` —
+  OpenRouter, for instance, takes `{"provider": {"require_parameters":
+  true}}`.
+- **`strict: true` constrains the schema.** OpenAI requires
+  `"additionalProperties": false` and every property listed in
+  `required`; a schema missing either comes back as an HTTP 400, recorded
+  as the task's error.
+
+On **Windows PowerShell**, prefer `--schema-file`. PowerShell 5.1 strips
+double quotes when passing arguments to a native executable, so inline
+`--schema '{"type":"object"}'` arrives as `{type:object}` and is rejected
+as invalid JSON. Backslash-escape them (`'{\"type\":\"object\"}'`) if you
+must inline it. The same hazard applies to any JSON you pass through
+`forebay add` to another CLI — `forebay results --json` shows the exact
+argv that was stored, which is the fastest way to confirm what survived.
 
 ## MCP: letting an agent queue work
 

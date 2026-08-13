@@ -66,6 +66,38 @@ func (f llmFlags) resolve() (system string, schema json.RawMessage, err error) {
 	return system, schema, nil
 }
 
+// llmFlagNames are forebay's own flags. One inside a prompt usually means
+// it was typed after the "--" separator and so was never applied.
+var llmFlagNames = map[string]bool{
+	"--schema": true, "--schema-file": true, "--system": true,
+	"--system-file": true, "--model": true, "--batch": true,
+	"--name": true, "--dir": true, "--glob": true, "--exclude": true,
+	"--dry-run": true,
+}
+
+// warnPromptFlags notes a forebay flag sitting in the prompt text.
+func warnPromptFlags(prompt []string) {
+	for _, a := range prompt {
+		name := a
+		if i := strings.IndexByte(name, '='); i >= 0 {
+			name = name[:i]
+		}
+		if llmFlagNames[name] {
+			fmt.Fprintf(os.Stderr, "warning: %s appears after \"--\", so it is part of the prompt "+
+				"text rather than an applied flag; move it before the \"--\" if that was not intended\n", name)
+			return
+		}
+	}
+}
+
+// describeSchema summarizes a resolved schema for queue-time feedback.
+func describeSchema(schema json.RawMessage) string {
+	if len(schema) == 0 {
+		return "free-form text (no --schema/--schema-file)"
+	}
+	return "structured output (json_schema, strict)"
+}
+
 // requireConfig verifies the LLM configuration is present and valid.
 func requireConfig(db *store.DB, modelOverride string) error {
 	cfg, err := llm.LoadConfig(db.HomeDir())
@@ -98,6 +130,7 @@ func cmdAddLLM(args []string) error {
 	if len(prompt) == 0 {
 		return fmt.Errorf("no user prompt given; usage: forebay add-llm [flags] -- USER PROMPT...")
 	}
+	warnPromptFlags(prompt)
 	system, schema, err := lf.resolve()
 	if err != nil {
 		return err
@@ -126,7 +159,7 @@ func cmdAddLLM(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("queued llm task %s on batch %q\n", id, batch.Name)
+	fmt.Printf("queued llm task %s on batch %q — %s\n", id, batch.Name, describeSchema(schema))
 	return nil
 }
 
@@ -148,6 +181,7 @@ func cmdBatchLLM(args []string) error {
 	if len(template) == 0 {
 		return fmt.Errorf("no user prompt template given after --")
 	}
+	warnPromptFlags(template)
 	system, schema, err := lf.resolve()
 	if err != nil {
 		return err
@@ -206,7 +240,7 @@ func cmdBatchLLM(args []string) error {
 			return err
 		}
 	}
-	fmt.Printf("queued %d llm tasks on batch %q — run them with: forebay run --batch %s\n",
-		len(files), batch.Name, batch.Name)
+	fmt.Printf("queued %d llm tasks on batch %q, %s — run them with: forebay run --batch %s\n",
+		len(files), batch.Name, describeSchema(schema), batch.Name)
 	return nil
 }

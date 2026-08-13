@@ -23,6 +23,9 @@ type Config struct {
 	APIKey         string `json:"api_key,omitempty"`
 	Model          string `json:"model,omitempty"`
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+	// ExtraBody is merged into every request body, for parameters forebay
+	// does not model itself. It cannot set the keys in managedKeys.
+	ExtraBody map[string]json.RawMessage `json:"extra_body,omitempty"`
 }
 
 const configExample = `{
@@ -30,6 +33,11 @@ const configExample = `{
   "api_key": "sk-...",
   "model": "gpt-4o-mini"
 }`
+
+// managedKeys are request body fields forebay derives from each task.
+var managedKeys = map[string]bool{
+	"model": true, "messages": true, "response_format": true,
+}
 
 // ConfigPath returns the config file location under the forebay home.
 func ConfigPath(homeDir string) string {
@@ -59,6 +67,11 @@ func LoadConfig(homeDir string) (Config, error) {
 	if cfg.BaseURL == "" {
 		return Config{}, fmt.Errorf("%s: base_url is required", path)
 	}
+	for k := range cfg.ExtraBody {
+		if managedKeys[k] {
+			return Config{}, fmt.Errorf("%s: extra_body cannot set %q; forebay sets it per task", path, k)
+		}
+	}
 	return cfg, nil
 }
 
@@ -82,16 +95,23 @@ func ParseSpec(payload string) (Spec, error) {
 	return s, nil
 }
 
+// Exchange is the raw HTTP conversation for one call, written to the
+// task log so what was sent and returned can be inspected.
+type Exchange struct {
+	Request  []byte
+	Response []byte
+}
+
 // Call performs one chat completion and returns the assistant message
-// content plus the raw response body (for the task log). It honors ctx
+// content plus the raw exchange (for the task log). It honors ctx
 // cancellation, which is how running LLM tasks get canceled.
-func Call(ctx context.Context, cfg Config, spec Spec) (content string, raw []byte, err error) {
+func Call(ctx context.Context, cfg Config, spec Spec) (content string, ex Exchange, err error) {
 	model := spec.Model
 	if model == "" {
 		model = cfg.Model
 	}
 	if model == "" {
-		return "", nil, fmt.Errorf("no model: set \"model\" in config.json or pass one on the task")
+		return "", ex, fmt.Errorf("no model: set \"model\" in config.json or pass one on the task")
 	}
 
 	var messages []map[string]string
@@ -111,15 +131,22 @@ func Call(ctx context.Context, cfg Config, spec Spec) (content string, raw []byt
 			},
 		}
 	}
+	for k, v := range cfg.ExtraBody {
+		if _, managed := body[k]; managed {
+			continue
+		}
+		body[k] = v
+	}
 	reqBody, err := json.Marshal(body)
 	if err != nil {
-		return "", nil, err
+		return "", ex, err
 	}
+	ex.Request = reqBody
 
 	url := strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
-		return "", nil, err
+		return "", ex, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if cfg.APIKey != "" {
@@ -133,15 +160,16 @@ func Call(ctx context.Context, cfg Config, spec Spec) (content string, raw []byt
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", nil, fmt.Errorf("POST %s: %w", url, err)
+		return "", ex, fmt.Errorf("POST %s: %w", url, err)
 	}
 	defer resp.Body.Close()
-	raw, err = io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	ex.Response = raw
 	if err != nil {
-		return "", raw, fmt.Errorf("read response from %s: %w", url, err)
+		return "", ex, fmt.Errorf("read response from %s: %w", url, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return "", raw, fmt.Errorf("POST %s: %s: %s", url, resp.Status, truncate(string(raw), 500))
+		return "", ex, fmt.Errorf("POST %s: %s: %s", url, resp.Status, truncate(string(raw), 500))
 	}
 
 	var parsed struct {
@@ -152,12 +180,12 @@ func Call(ctx context.Context, cfg Config, spec Spec) (content string, raw []byt
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return "", raw, fmt.Errorf("unexpected response shape from %s: %w", url, err)
+		return "", ex, fmt.Errorf("unexpected response shape from %s: %w", url, err)
 	}
 	if len(parsed.Choices) == 0 {
-		return "", raw, fmt.Errorf("response from %s has no choices", url)
+		return "", ex, fmt.Errorf("response from %s has no choices", url)
 	}
-	return parsed.Choices[0].Message.Content, raw, nil
+	return parsed.Choices[0].Message.Content, ex, nil
 }
 
 // truncate shortens s to at most n characters, appending "..." if truncated.

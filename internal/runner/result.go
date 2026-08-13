@@ -7,9 +7,8 @@ import (
 	"strconv"
 )
 
-// maxResultEnv caps how many bytes of a task's output are stored in the
-// database. Unset or 0 means unlimited: the whole log becomes the result.
-// The log file on disk is never truncated regardless of this setting.
+// maxResultEnv caps how many bytes of output are stored in the database.
+// Unset or 0 means unlimited; the log on disk is never truncated.
 const maxResultEnv = "FOREBAY_MAX_RESULT_BYTES"
 
 // resultLimit returns the configured result cap in bytes, or 0 for no cap.
@@ -26,10 +25,8 @@ func resultLimit() int64 {
 	return n
 }
 
-// captureResult reads a finished task's log back so it can be stored as
-// the task's result. Over the limit (when one is set) it keeps the head
-// and tail — the start of the output and the failure at the end are the
-// two parts worth having — with a marker pointing at the full log.
+// captureResult reads a finished task's log back for storage as its
+// result, keeping the head and tail if it exceeds limit.
 func captureResult(path string, limit int64) string {
 	if path == "" {
 		return ""

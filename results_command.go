@@ -27,8 +27,7 @@ type resultRow struct {
 	LogPath    string   `json:"log_path,omitempty"`
 }
 
-// cmdResults handles the 'results' subcommand: the saved output of every
-// task, exec and llm alike, filtered and optionally machine-readable.
+// cmdResults handles the 'results' subcommand for saved task output.
 func cmdResults(args []string) error {
 	fs := flag.NewFlagSet("results", flag.ExitOnError)
 	batchName := fs.String("batch", "", "filter by batch name")
@@ -37,7 +36,22 @@ func cmdResults(args []string) error {
 	contains := fs.String("contains", "", "only results containing this substring (case-insensitive)")
 	limit := fs.Int("limit", 0, "maximum tasks to show (default: no limit)")
 	asJSON := fs.Bool("json", false, "output as a JSON array")
-	fs.Parse(args)
+	// Parse in a loop so flags still apply after the positional TASK_ID;
+	// flag.Parse otherwise stops at the first non-flag argument.
+	var positional []string
+	for rest := args; ; {
+		if err := fs.Parse(rest); err != nil {
+			return err
+		}
+		if fs.NArg() == 0 {
+			break
+		}
+		positional = append(positional, fs.Arg(0))
+		rest = fs.Args()[1:]
+	}
+	if len(positional) > 1 {
+		return fmt.Errorf("at most one TASK_ID may be given, got %d", len(positional))
+	}
 	if *kind != "" && *kind != store.KindExec && *kind != store.KindLLM {
 		return fmt.Errorf("--kind must be %q or %q", store.KindExec, store.KindLLM)
 	}
@@ -49,8 +63,8 @@ func cmdResults(args []string) error {
 	filter := store.ResultFilter{
 		Status: *status, Kind: *kind, Contains: *contains, Limit: *limit,
 	}
-	if fs.NArg() > 0 {
-		filter.TaskID = fs.Arg(0)
+	if len(positional) == 1 {
+		filter.TaskID = positional[0]
 	}
 	if *batchName != "" {
 		b, err := db.GetBatch(*batchName)
