@@ -96,7 +96,7 @@ func main() {
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	case "version", "--version":
-		fmt.Println("forebay 0.1.0")
+		fmt.Println("forebay 0.2.0")
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
 		os.Exit(2)
