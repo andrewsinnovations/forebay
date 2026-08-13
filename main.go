@@ -31,7 +31,8 @@ Usage:
   forebay run    [-j N] [--batch NAME] [--watch] [--interval SECONDS]
   forebay status
   forebay list   [--batch NAME] [--status STATUS] [--limit N]
-  forebay results [--batch NAME] [--status STATUS] [--limit N] [--json]
+  forebay results [TASK_ID] [--batch NAME] [--status STATUS] [--kind exec|llm]
+                  [--contains TEXT] [--limit N] [--json]
   forebay logs   TASK_ID
   forebay cancel [TASK_ID] [--batch NAME] [--all]
   forebay reset  [--failed] [--all]
@@ -42,9 +43,12 @@ Commands are argv arrays — forebay never invokes a shell. In batch and
 batch-llm templates, use placeholders per matched file: {path}
 {slashpath} {relpath} {name} {base} {dir}.
 
+Every task saves its output as a result: the captured stdout+stderr for
+commands, the model reply for LLM tasks. Query them with "forebay
+results" (whole log; set FOREBAY_MAX_RESULT_BYTES to cap what is stored).
+
 LLM tasks (add-llm, batch-llm) POST to the OpenAI-compatible API
-configured in ~/.forebay/config.json and save each reply for
-"forebay results".
+configured in ~/.forebay/config.json.
 
 Example:
   forebay batch --name jsdoc --glob "src/**/*.js" -- \

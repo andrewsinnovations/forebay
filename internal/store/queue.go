@@ -133,7 +133,8 @@ func (d *DB) MarkStarted(taskID, logPath string) error {
 }
 
 // MarkFinished settles a task into done/failed/canceled. result is the
-// saved output for llm tasks; exec tasks pass "".
+// task's saved output — the model reply for llm tasks, the captured
+// stdout+stderr for exec tasks — queryable with `forebay results`.
 func (d *DB) MarkFinished(taskID, status string, exitCode int, errMsg, result string) error {
 	_, err := d.Exec(`UPDATE tasks SET status = ?, finished_at = ?, exit_code = ?, error = ?,
 		result = ? WHERE id = ?`, status, now(), exitCode, errMsg, result, taskID)
@@ -144,7 +145,8 @@ func (d *DB) MarkFinished(taskID, status string, exitCode int, errMsg, result st
 // interrupted mid-task, so the work is retried on the next run).
 func (d *DB) Requeue(taskID string) error {
 	_, err := d.Exec(`UPDATE tasks SET status = 'pending', runner = NULL, claimed_at = NULL,
-		heartbeat_at = NULL, started_at = NULL, cancel_requested = 0 WHERE id = ?`, taskID)
+		heartbeat_at = NULL, started_at = NULL, result = NULL, cancel_requested = 0
+		WHERE id = ?`, taskID)
 	return err
 }
 
@@ -152,7 +154,7 @@ func (d *DB) Requeue(taskID string) error {
 func (d *DB) ReclaimStale(olderThan time.Duration) (int64, error) {
 	cutoff := time.Now().UTC().Add(-olderThan).Format(time.RFC3339)
 	res, err := d.Exec(`UPDATE tasks SET status = 'pending', runner = NULL, claimed_at = NULL,
-		heartbeat_at = NULL, started_at = NULL, cancel_requested = 0
+		heartbeat_at = NULL, started_at = NULL, result = NULL, cancel_requested = 0
 		WHERE status = 'running' AND (heartbeat_at IS NULL OR heartbeat_at < ?)`, cutoff)
 	if err != nil {
 		return 0, err
@@ -173,7 +175,7 @@ func (d *DB) Reset(failed, all bool) (int64, error) {
 	}
 	res, err := d.Exec(`UPDATE tasks SET status = 'pending', runner = NULL, claimed_at = NULL,
 		heartbeat_at = NULL, started_at = NULL, finished_at = NULL, exit_code = NULL,
-		error = NULL, cancel_requested = 0 WHERE ` + strings.Join(conds, " OR "))
+		error = NULL, result = NULL, cancel_requested = 0 WHERE ` + strings.Join(conds, " OR "))
 	if err != nil {
 		return 0, err
 	}
@@ -323,6 +325,66 @@ func (d *DB) ListTasks(batchID, status, kind string, limit int) ([]Task, error) 
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// ResultFilter selects saved task outputs. Zero fields match everything.
+type ResultFilter struct {
+	TaskID   string
+	BatchID  string
+	Status   string
+	Kind     string
+	Contains string // substring of the saved result (ASCII case-insensitive)
+	Limit    int
+}
+
+// Results returns tasks and their saved output, oldest first.
+func (d *DB) Results(f ResultFilter) ([]Task, error) {
+	q := taskSelect + ` WHERE 1=1`
+	var args []any
+	for _, c := range []struct {
+		cond string
+		val  string
+	}{
+		{` AND t.id = ?`, f.TaskID},
+		{` AND t.batch_id = ?`, f.BatchID},
+		{` AND t.status = ?`, f.Status},
+		{` AND t.kind = ?`, f.Kind},
+	} {
+		if c.val != "" {
+			q += c.cond
+			args = append(args, c.val)
+		}
+	}
+	if f.Contains != "" {
+		q += ` AND t.result LIKE ? ESCAPE '\'`
+		args = append(args, "%"+escapeLike(f.Contains)+"%")
+	}
+	q += ` ORDER BY t.seq`
+	if f.Limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, f.Limit)
+	}
+	rows, err := d.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// escapeLike neutralizes SQL LIKE wildcards so a search string matches
+// literally (paired with ESCAPE '\').
+func escapeLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }
 
 // taskSelect is the base query for fetching tasks with batch names.

@@ -44,7 +44,7 @@ command. Everything after `--` is the command.
 | `forebay batch --glob PAT [--glob ...] [--name N] [--dir ROOT] [--exclude PAT] [--dry-run] -- TEMPLATE...` | Expand globs into one task per matched file. |
 | `forebay add-llm [--system TEXT] [--schema-file F] [--model M] -- PROMPT...` | Queue one direct LLM API call. |
 | `forebay batch-llm --glob PAT ... [--system TEXT] [--schema-file F] -- PROMPT TEMPLATE...` | One LLM call per matched file. |
-| `forebay results [--batch N] [--status S] [--json]` | Print saved LLM replies. |
+| `forebay results [TASK_ID] [--batch N] [--status S] [--kind exec\|llm] [--contains TEXT] [--limit N] [--json]` | Query saved task output. |
 | `forebay run [-j N] [--batch NAME] [--watch] [--interval SECS]` | Claim and execute pending tasks. `--watch` keeps polling after the queue drains. |
 | `forebay status` | Per-batch counts. |
 | `forebay list [--batch N] [--status S] [--limit N]` | Task detail. |
@@ -69,6 +69,36 @@ In `forebay batch` templates, each matched file substitutes:
 `**/node_modules/**` and `**/.git/**` are excluded by default; pass your
 own `--exclude` to override. Use `--dry-run` to preview the expansion
 before queueing.
+
+## Results: every task's output, queryable
+
+Each task stores its complete output in the database when it settles —
+captured stdout+stderr for commands, the model reply for LLM tasks — so
+the queue doubles as a result set you can query after the fact. Canceled
+tasks keep whatever they produced before they were killed.
+
+```sh
+forebay results                          # everything, oldest first
+forebay results --batch jsdoc            # one batch
+forebay results --status failed          # only failures
+forebay results --kind exec              # commands (or --kind llm)
+forebay results --contains "TODO"        # output matching a substring
+forebay results a1b2c3d4                 # one task by id
+forebay results --batch jsdoc --json     # machine-readable
+```
+
+`--json` emits one object per task: `task_id`, `batch`, `kind`,
+`status`, `command` or `user_prompt`, `exit_code`, `started_at`,
+`finished_at`, `result`, `error`, `log_path` — pipe it to `jq` for
+anything the flags don't cover, or query `~/.forebay/forebay.db`
+directly (`SELECT id, result FROM tasks WHERE ...`).
+
+Output is stored whole, with no truncation. If a task can emit more
+than you want in SQLite, set `FOREBAY_MAX_RESULT_BYTES` when running:
+the stored result keeps the head and tail up to that many bytes with a
+marker naming the log file in between, while the log on disk stays
+complete. `forebay logs TASK_ID` always prints the untruncated log, and
+`forebay clean` drops results and logs together.
 
 ## LLM tasks: direct API calls without an agent
 
@@ -103,7 +133,7 @@ forebay run -j 4
 
 # Read the replies
 forebay results --batch jssum          # human-readable
-forebay results --batch jssum --json   # [{task_id, batch, status, user_prompt, result, error}]
+forebay results --batch jssum --json   # machine-readable (see "Results")
 ```
 
 `--system`/`--system-file` set the system prompt, `--schema`/
@@ -174,8 +204,10 @@ Two design choices make scheduled runs safe and reliable:
   on Unix; a Job Object with `TerminateJobObject` on Windows, so an
   agent's grandchildren can't survive as orphans. Graceful shutdown is
   best-effort on Windows (CTRL_BREAK, then hard kill after 5s).
-- **Logs** are written to `~/.forebay/logs/<batch-id>/<task-id>.log`.
-  With `-j 1` output also streams to your terminal.
+- **Logs** are written to `~/.forebay/logs/<batch-id>/<task-id>.log`, and
+  the same output is saved on the task as its result when it settles
+  (see [Results](#results-every-tasks-output-queryable)). With `-j 1`
+  output also streams to your terminal.
 - **Failure** is exit code ≠ 0 or a spawn error; retry with
   `forebay reset --failed` then `forebay run`.
 - Set `FOREBAY_HOME` to relocate all state (useful for tests).

@@ -189,7 +189,8 @@ func executeTask(ctx context.Context, db *store.DB, task *store.Task, tee bool) 
 					exitCode = exitErr.ExitCode()
 				}
 			}
-			db.MarkFinished(task.ID, status, exitCode, errMsg, "")
+			logFile.Sync()
+			db.MarkFinished(task.ID, status, exitCode, errMsg, captureResult(logPath, resultLimit()))
 			fmt.Printf("[%s/%s] %s (exit %d, %s)\n",
 				batch.Name, task.ID, status, exitCode, time.Since(start).Round(time.Second))
 			return
@@ -202,7 +203,10 @@ func executeTask(ctx context.Context, db *store.DB, task *store.Task, tee bool) 
 			}
 			if cancel {
 				killTree(cmd, tree, waitCh)
-				db.MarkFinished(task.ID, store.StatusCanceled, -1, "canceled by user", "")
+				logFile.Sync()
+				// Partial output is still worth keeping on a cancel.
+				db.MarkFinished(task.ID, store.StatusCanceled, -1, "canceled by user",
+					captureResult(logPath, resultLimit()))
 				fmt.Printf("[%s/%s] canceled\n", batch.Name, task.ID)
 				return
 			}
