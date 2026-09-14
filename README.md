@@ -9,6 +9,12 @@ There is no background process. State lives in a SQLite database under
 coordinates through it. Nothing executes until you type `forebay run`
 or your scheduler does it for you.
 
+## When to use each command
+
+- **`forebay add`**: For a single, ad-hoc task. Use when you know exactly what command to run right now.
+- **`forebay batch`**: For templated tasks based on files. Ideal when you want to process many files with the same logic (e.g., adding JSDoc comments to all JS files).
+- **`forebay add-llm` / `forebay batch-llm`**: For LLM-based tasks. Similar distinction: single call vs. one call per file.
+
 ## Install
 
 ```
@@ -23,6 +29,13 @@ or build from source: `go build -o forebay .`
 # Queue one task per *.js file, from a command template
 forebay batch --name jsdoc --glob "src/**/*.js" -- \
   claude -p "analyze '{relpath}' and add jsdoc comments to every function"
+
+# See overall queue statistics
+forebay summary
+
+# Queue a single task with a complex command containing multiple `--`
+# Note: Placeholders like {relpath} are only used in batch commands, not in --command
+forebay add --batch mytask --command "echo hello -- arg1 -- arg2"
 
 # See what's queued
 forebay status
@@ -40,19 +53,20 @@ command. Everything after `--` is the command.
 
 | Command | What it does |
 | --- | --- |
-| `forebay add [--batch NAME] [--dir DIR] -- CMD [ARGS...]` | Queue a single command. |
-| `forebay batch --glob PAT [--glob ...] [--name N] [--dir ROOT] [--exclude PAT] [--dry-run] -- TEMPLATE...` | Expand globs into one task per matched file. |
-| `forebay add-llm [--system TEXT] [--schema-file F] [--model M] -- PROMPT...` | Queue one direct LLM API call. |
-| `forebay batch-llm --glob PAT ... [--system TEXT] [--schema-file F] -- PROMPT TEMPLATE...` | One LLM call per matched file. |
-| `forebay results [TASK_ID] [--batch N] [--status S] [--kind exec\|llm] [--contains TEXT] [--limit N] [--json]` | Query saved task output. |
-| `forebay run [-j N] [--batch NAME] [--watch] [--interval SECS]` | Claim and execute pending tasks. `--watch` keeps polling after the queue drains. |
-| `forebay status` | Per-batch counts. |
-| `forebay list [--batch N] [--status S] [--limit N]` | Task detail. |
-| `forebay logs TASK_ID` | Print a task's captured output. |
-| `forebay cancel [TASK_ID] [--batch N] [--all]` | Cancel pending tasks immediately; running tasks are killed (whole process tree) within a few seconds. |
-| `forebay reset [--failed] [--all]` | Requeue interrupted (and optionally failed) tasks. |
-| `forebay clean [--batch N] [--all]` | Delete finished task history and its log files (`--all` also drops pending; running tasks always survive). |
-| `forebay mcp` | Run the stdio MCP server. |
+| `forebay add [--batch NAME] [--dir DIR] [--command CMD] -- CMD [ARGS...]` | Queue a single command onto a batch. Use `--command "CMD"` for complex commands with multiple `--`. Placeholders like `{relpath}` are not supported here; use `forebay batch` instead. |
+| `forebay batch --glob PAT [--glob ...] [--name N] [--dir ROOT] [--exclude PAT] [--dry-run] -- TEMPLATE...` | Expand globs into tasks for execution or LLM processing. |
+| `forebay add-llm [--system TEXT|--system-file F] [--schema JSON|--schema-file F] [--model M] -- PROMPT...` | Queue a single LLM task for direct API execution. |
+| `forebay batch-llm --glob PAT ... [--system TEXT|--system-file F] [--schema JSON|--schema-file F] [--model M] [--dry-run] -- PROMPT TEMPLATE...` | Queue one LLM task per matched file for direct API execution. |
+| `forebay results [TASK_ID] [--batch NAME] [--status STATUS] [--kind exec|--kind llm] [--contains TEXT] [--limit N] [--json]` | Query saved task output (results and logs) with optional filtering. |
+| `forebay run [-j N] [--batch NAME] [--watch] [--interval SECS]` | Claim and execute pending tasks in parallel. `--watch` keeps polling for new tasks after the queue drains. |
+| `forebay status` | Show a summary of task counts per batch (pending, running, done, failed, canceled). |
+| `forebay list [--batch NAME] [--status STATUS] [--limit N]` | List tasks with optional filtering by batch name or status. |
+| `forebay logs TASK_ID` | Print a task's untruncated captured output. |
+| `forebay cancel [TASK_ID] [--batch NAME] [--all]` | Cancel pending tasks immediately and kill running tasks within a few seconds. |
+| `forebay reset [--failed] [--all]` | Requeue pending and/or failed tasks. |
+| `forebay summary` | Show overall queue statistics (pending, running, done, failed, canceled). |
+| `forebay clean [--batch NAME] [--all]` | Delete results and logs for finished (and optionally pending) tasks. Running tasks are never cleaned up. |
+| `forebay mcp` | Run the stdio MCP server. The agent gets four tools: `queue_task`, `queue_status`, `list_task`, and `cancel`. |
 
 ### Template placeholders
 

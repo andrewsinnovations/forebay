@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -27,8 +28,8 @@ type resultRow struct {
 	LogPath    string   `json:"log_path,omitempty"`
 }
 
-// cmdResults handles the 'results' subcommand for saved task output.
-func cmdResults(args []string) error {
+// results prints the saved output of tasks matching the given filters.
+func results(args []string) error {
 	fs := flag.NewFlagSet("results", flag.ExitOnError)
 	batchName := fs.String("batch", "", "filter by batch name")
 	status := fs.String("status", "", "filter by status (pending|running|done|failed|canceled)")
@@ -53,9 +54,9 @@ func cmdResults(args []string) error {
 		return fmt.Errorf("at most one TASK_ID may be given, got %d", len(positional))
 	}
 	if *kind != "" && *kind != store.KindExec && *kind != store.KindLLM {
-		return fmt.Errorf("--kind must be %q or %q", store.KindExec, store.KindLLM)
+		return errors.New("--kind must be \"exec\" or \"llm\"")
 	}
-	db, err := openDB()
+	db, err := store.Open()
 	if err != nil {
 		return err
 	}

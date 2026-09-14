@@ -11,7 +11,8 @@ import (
 // Unset or 0 means unlimited; the log on disk is never truncated.
 const maxResultEnv = "FOREBAY_MAX_RESULT_BYTES"
 
-// resultLimit returns the configured result cap in bytes, or 0 for no cap.
+// resultLimit returns the configured result cap in bytes, or 0 for no cap. A
+// value that does not parse is ignored with a warning on stderr.
 func resultLimit() int64 {
 	v := os.Getenv(maxResultEnv)
 	if v == "" {
@@ -25,8 +26,10 @@ func resultLimit() int64 {
 	return n
 }
 
-// captureResult reads a finished task's log back for storage as its
-// result, keeping the head and tail if it exceeds limit.
+// captureResult reads a finished task's log back for storage as its result,
+// keeping the head and tail when the log exceeds limit. Output is best-effort:
+// a log that cannot be read yields an empty result rather than an error, since
+// the task has already reached a terminal status and the file remains on disk.
 func captureResult(path string, limit int64) string {
 	if path == "" {
 		return ""

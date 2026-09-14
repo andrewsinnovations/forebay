@@ -2,6 +2,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -37,6 +39,7 @@ Usage:
   forebay cancel [TASK_ID] [--batch NAME] [--all]
   forebay reset  [--failed] [--all]
   forebay clean  [--batch NAME] [--all]
+  forebay summary
   forebay mcp
 
 Commands are argv arrays — forebay never invokes a shell. In batch and
@@ -59,6 +62,11 @@ Example:
   forebay results --batch summarize
 `
 
+// openDB opens the task database.
+func openDB() (*store.DB, error) {
+	return store.Open()
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
@@ -68,35 +76,37 @@ func main() {
 	var err error
 	switch cmd {
 	case "add":
-		err = cmdAdd(args)
+		err = add(args)
 	case "batch":
-		err = cmdBatch(args)
+		err = batchQueued(args)
 	case "add-llm":
-		err = cmdAddLLM(args)
+		err = addLLM(args)
 	case "batch-llm":
-		err = cmdBatchLLM(args)
+		err = batchLLM(args)
 	case "results":
-		err = cmdResults(args)
+		err = results(args)
 	case "run":
-		err = cmdRun(args)
+		err = run(args)
 	case "status":
-		err = cmdStatus(args)
+		err = status(args)
 	case "list":
-		err = cmdList(args)
+		err = listTasks(args)
 	case "logs":
-		err = cmdLogs(args)
+		err = logs(args)
 	case "cancel":
-		err = cmdCancel(args)
+		err = cancel(args)
 	case "reset":
-		err = cmdReset(args)
+		err = reset(args)
 	case "clean":
-		err = cmdClean(args)
+		err = clean(args)
 	case "mcp":
-		err = cmdMCP()
+		err = startMCPServer()
+	case "summary":
+		err = summary(args)
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	case "version", "--version":
-		fmt.Println("forebay 0.2.0")
+		fmt.Println("forebay 0.3.0")
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
 		os.Exit(2)
@@ -107,41 +117,61 @@ func main() {
 	}
 }
 
-// splitAtDashDash separates arguments before and after "--".
-func splitAtDashDash(args []string) (flags, command []string) {
+// splitArgs splits args at the last "--" separator, returning the flags and
+// the trailing command respectively. This allows multiple -- to be used for
+// template placeholders in batch commands.
+func splitArgs(args []string) (flags, rest []string) {
+	lastDash := -1
 	for i, a := range args {
 		if a == "--" {
-			return args[:i], args[i+1:]
+			lastDash = i
 		}
 	}
-	return args, nil
-}
-
-// openDB opens the task database.
-func openDB() (*store.DB, error) {
-	return store.Open()
-}
-
-// cmdAdd handles the 'add' subcommand for queuing a single task.
-func cmdAdd(args []string) error {
-	flagArgs, command := splitAtDashDash(args)
-	fs := flag.NewFlagSet("add", flag.ExitOnError)
-	batchName := fs.String("batch", "default", "batch name to queue onto (created if missing)")
-	dir := fs.String("dir", "", "working directory for the batch (default: current directory; only applies on batch creation)")
-	fs.Parse(flagArgs)
-	if len(command) == 0 {
-		return fmt.Errorf("no command given; usage: forebay add [--batch NAME] -- CMD [ARGS...]")
+	if lastDash == -1 {
+		return args, nil
 	}
-	db, err := openDB()
+	// If there are multiple --, take everything after the last one as rest
+	rest = args[lastDash+1:]
+	// flags is everything before the last --
+	flags = args[:lastDash]
+	return flags, rest
+}
+
+// add queues a single task onto a batch.
+func add(args []string) error {
+	flagArgs, command := splitArgs(args)
+	// Parse known flags manually to avoid issues with multiple "--" separators
+	var commandStr string
+	for i, arg := range flagArgs {
+		if arg == "--command" && i+1 < len(flagArgs) {
+			commandStr = flagArgs[i+1]
+		}
+	}
+	batchName := "default"
+	dirVal := ""
+	fs := flag.NewFlagSet("add", flag.ExitOnError)
+	fs.String("batch", batchName, "batch name to queue onto (created if missing)")
+	fs.String("dir", dirVal, "working directory for the batch (default: current directory; only applies on batch creation)")
+	fs.String("command", commandStr, "full command as a string (alternative to specifying command after --)")
+	if err := fs.Parse(flagArgs); err != nil {
+		return fmt.Errorf("parsing flags: %w", err)
+	}
+	// Use the explicit command if provided, otherwise use the args after --
+	if commandStr != "" {
+		command = strings.Fields(commandStr)
+	} else if len(command) == 0 {
+		return errors.New("no command given; usage: forebay add [--batch NAME] -- CMD [ARGS...] or forebay add --command \"CMD [ARGS...]\"")
+	}
+	db, err := store.Open()
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	workdir, err := resolveWorkdir(*dir)
+	workdir, err := resolveWorkdir(dirVal)
 	if err != nil {
 		return err
 	}
-	batch, err := db.EnsureBatch(*batchName, workdir, os.Environ())
+	batch, err := db.EnsureBatch(batchName, workdir, os.Environ())
 	if err != nil {
 		return err
 	}
@@ -153,9 +183,9 @@ func cmdAdd(args []string) error {
 	return nil
 }
 
-// cmdBatch handles the 'batch' subcommand for queuing tasks from glob patterns.
-func cmdBatch(args []string) error {
-	flagArgs, template := splitAtDashDash(args)
+// batchQueued queues tasks from glob patterns against a command template.
+func batchQueued(args []string) error {
+	flagArgs, template := splitArgs(args)
 	fs := flag.NewFlagSet("batch", flag.ExitOnError)
 	name := fs.String("name", "", "batch name (default: batch-<id>)")
 	dir := fs.String("dir", "", "root directory for glob expansion and task execution (default: current directory)")
@@ -165,10 +195,10 @@ func cmdBatch(args []string) error {
 	fs.Var(&excludes, "exclude", "glob pattern to skip (repeatable; default: **/node_modules/**, **/.git/**)")
 	fs.Parse(flagArgs)
 	if len(globs) == 0 {
-		return fmt.Errorf("at least one --glob is required")
+		return errors.New("at least one --glob is required")
 	}
 	if len(template) == 0 {
-		return fmt.Errorf("no command template given after --")
+		return errors.New("no command template given after --")
 	}
 	root, err := resolveWorkdir(*dir)
 	if err != nil {
@@ -192,7 +222,7 @@ func cmdBatch(args []string) error {
 		fmt.Printf("(%d tasks; dry run, nothing queued)\n", len(files))
 		return nil
 	}
-	db, err := openDB()
+	db, err := store.Open()
 	if err != nil {
 		return err
 	}
@@ -215,26 +245,25 @@ func cmdBatch(args []string) error {
 	return nil
 }
 
-// cmdRun handles the 'run' subcommand for executing queued tasks.
-func cmdRun(args []string) error {
+// run executes queued tasks.
+func run(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	workers := fs.Int("j", 1, "number of tasks to run in parallel")
 	batchName := fs.String("batch", "", "only run tasks from this batch")
 	watch := fs.Bool("watch", false, "keep polling for new tasks after the queue drains")
 	interval := fs.Int("interval", 5, "poll interval in seconds for --watch")
 	fs.Parse(args)
-	db, err := openDB()
+	db, err := store.Open()
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	// In watch mode, the batch may not exist yet.
 	if *batchName != "" && !*watch {
 		if _, err := db.GetBatch(*batchName); err != nil {
 			return err
 		}
 	}
-	return runner.Run(db, runner.Options{
+	return runner.Run(context.Background(), db, runner.Options{
 		Workers:  *workers,
 		Batch:    *batchName,
 		Watch:    *watch,
@@ -242,9 +271,9 @@ func cmdRun(args []string) error {
 	})
 }
 
-// cmdStatus handles the 'status' subcommand for displaying batch summaries.
-func cmdStatus(args []string) error {
-	db, err := openDB()
+// status prints per-batch task count summaries.
+func status(args []string) error {
+	db, err := store.Open()
 	if err != nil {
 		return err
 	}
@@ -267,19 +296,19 @@ func cmdStatus(args []string) error {
 	return nil
 }
 
-// cmdList handles the 'list' subcommand for displaying tasks.
-func cmdList(args []string) error {
+// listTasks prints tasks matching the given filters.
+func listTasks(args []string) error {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	batchName := fs.String("batch", "", "filter by batch name")
 	status := fs.String("status", "", "filter by status (pending|running|done|failed|canceled)")
 	limit := fs.Int("limit", 100, "maximum tasks to show")
 	fs.Parse(args)
-	db, err := openDB()
+	db, err := store.Open()
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	batchID := ""
+	var batchID string
 	if *batchName != "" {
 		b, err := db.GetBatch(*batchName)
 		if err != nil {
@@ -301,31 +330,30 @@ func cmdList(args []string) error {
 		if t.ExitCode != nil {
 			exit = fmt.Sprintf("%d", *t.ExitCode)
 		}
+
+		desc := strings.Join(t.Argv, " ")
+		if t.Kind == store.KindLLM {
+			spec, err := llm.ParseSpec(t.Payload)
+			if err != nil {
+				desc = "llm: (corrupt payload)"
+			} else {
+				desc = "llm: " + spec.User
+			}
+		}
+
 		fmt.Printf("%-8s %-16s %-9s %-5s %s\n",
 			t.ID, truncate(t.BatchName, 16), t.Status, exit,
-			truncate(describeTask(t), 80))
+			truncate(desc, 80))
 	}
 	return nil
 }
 
-// describeTask renders a task's work for one-line displays.
-func describeTask(t store.Task) string {
-	if t.Kind == store.KindLLM {
-		spec, err := llm.ParseSpec(t.Payload)
-		if err != nil {
-			return "llm: (corrupt payload)"
-		}
-		return "llm: " + spec.User
-	}
-	return strings.Join(t.Argv, " ")
-}
-
-// cmdLogs handles the 'logs' subcommand for displaying task output.
-func cmdLogs(args []string) error {
+// logs prints the captured output of a task.
+func logs(args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: forebay logs TASK_ID")
+		return errors.New("usage: forebay logs TASK_ID")
 	}
-	db, err := openDB()
+	db, err := store.Open()
 	if err != nil {
 		return err
 	}
@@ -339,29 +367,31 @@ func cmdLogs(args []string) error {
 	}
 	data, err := os.ReadFile(task.LogPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("read task log: %w", err)
 	}
-	os.Stdout.Write(data)
+	if _, err := os.Stdout.Write(data); err != nil {
+		return fmt.Errorf("write task log: %w", err)
+	}
 	fmt.Fprintf(os.Stderr, "\n(log file: %s)\n", task.LogPath)
 	return nil
 }
 
-// cmdCancel handles the 'cancel' subcommand for stopping tasks.
-func cmdCancel(args []string) error {
+// cancel stops pending or running tasks.
+func cancel(args []string) error {
 	fs := flag.NewFlagSet("cancel", flag.ExitOnError)
 	batchName := fs.String("batch", "", "cancel every pending/running task in this batch")
 	all := fs.Bool("all", false, "cancel every pending/running task in the queue")
 	fs.Parse(args)
-	taskID := ""
+	var taskID string
 	if fs.NArg() > 0 {
 		taskID = fs.Arg(0)
 	}
-	db, err := openDB()
+	db, err := store.Open()
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	batchID := ""
+	var batchID string
 	if *batchName != "" {
 		b, err := db.GetBatch(*batchName)
 		if err != nil {
@@ -377,13 +407,13 @@ func cmdCancel(args []string) error {
 	return nil
 }
 
-// cmdReset handles the 'reset' subcommand for requeuing tasks.
-func cmdReset(args []string) error {
+// reset requeues tasks that are not done.
+func reset(args []string) error {
 	fs := flag.NewFlagSet("reset", flag.ExitOnError)
 	failed := fs.Bool("failed", false, "also requeue failed tasks")
 	all := fs.Bool("all", false, "requeue everything that is not done (running, failed, canceled)")
 	fs.Parse(args)
-	db, err := openDB()
+	db, err := store.Open()
 	if err != nil {
 		return err
 	}
@@ -396,14 +426,14 @@ func cmdReset(args []string) error {
 	return nil
 }
 
-// cmdMCP handles the 'mcp' subcommand for starting the MCP server.
-func cmdMCP() error {
-	db, err := openDB()
+// startMCPServer serves the forebay tools over the Model Context Protocol.
+func startMCPServer() error {
+	db, err := store.Open()
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	return mcpserver.Serve(db)
+	return mcpserver.Serve(context.Background(), db)
 }
 
 // resolveWorkdir returns the absolute path to an existing directory.
@@ -425,6 +455,40 @@ func resolveWorkdir(dir string) (string, error) {
 	return abs, nil
 }
 
+// summary handles the 'summary' subcommand for displaying overall queue statistics.
+func summary(args []string) error {
+	db, err := openDB()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	statuses, err := db.Status()
+	if err != nil {
+		return err
+	}
+	if len(statuses) == 0 {
+		fmt.Println("no batches found — add tasks with `forebay add` or `forebay batch`")
+		return nil
+	}
+	// Calculate totals across all batches
+	var totalPending, totalRunning, totalDone, totalFailed, totalCanceled int
+	for _, s := range statuses {
+		totalPending += s.Pending
+		totalRunning += s.Running
+		totalDone += s.Done
+		totalFailed += s.Failed
+		totalCanceled += s.Canceled
+	}
+	fmt.Printf("Overall Queue Summary\n")
+	fmt.Printf("====================\n")
+	fmt.Printf("Pending: %d\n", totalPending)
+	fmt.Printf("Running: %d\n", totalRunning)
+	fmt.Printf("Done:    %d\n", totalDone)
+	fmt.Printf("Failed:  %d\n", totalFailed)
+	fmt.Printf("Canceled:%d\n", totalCanceled)
+	return nil
+}
+
 // truncate limits s to at most n characters, adding "..." if truncated.
 func truncate(s string, n int) string {
 	if len(s) <= n {
@@ -433,8 +497,12 @@ func truncate(s string, n int) string {
 	return s[:n-3] + "..."
 }
 
-// multiFlag collects repeated string flags.
+// multiFlag collects repeated string flags into a slice.
 type multiFlag []string
 
-func (m *multiFlag) String() string     { return strings.Join(*m, ", ") }
-func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
+func (m *multiFlag) String() string { return strings.Join(*m, ", ") }
+
+func (m *multiFlag) Set(v string) error {
+	*m = append(*m, v)
+	return nil
+}

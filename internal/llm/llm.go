@@ -8,13 +8,34 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+)
+
+// Errors reported by this package. Callers can test for them with errors.Is.
+var (
+	// ErrConfigMissing reports that no LLM config file was found in the
+	// forebay home directory.
+	ErrConfigMissing = errors.New("llm: config file missing")
+
+	// ErrConfigInvalid reports that the LLM config file exists but is unusable.
+	ErrConfigInvalid = errors.New("llm: invalid config")
+
+	// ErrNoModel reports that neither the task nor the config named a model.
+	ErrNoModel = errors.New("llm: no model configured")
+
+	// ErrSpecInvalid reports a task payload that cannot be decoded into a Spec.
+	ErrSpecInvalid = errors.New("llm: invalid task payload")
+
+	// ErrBadStatus reports a non-2xx reply from the chat completions endpoint.
+	ErrBadStatus = errors.New("llm: endpoint returned an error status")
 )
 
 // Config holds API credentials and default settings.
@@ -50,26 +71,30 @@ func StripBOM(data []byte) []byte {
 	return bytes.TrimPrefix(data, []byte(bom))
 }
 
-// LoadConfig reads and validates config.json from the forebay home.
+// LoadConfig reads and validates config.json from the forebay home. If the
+// file does not exist, LoadConfig returns an error wrapping ErrConfigMissing;
+// if it exists but is unusable, the error wraps ErrConfigInvalid.
 func LoadConfig(homeDir string) (Config, error) {
 	path := ConfigPath(homeDir)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return Config{}, fmt.Errorf("LLM tasks require %s; create it like:\n%s", path, configExample)
+		if errors.Is(err, fs.ErrNotExist) {
+			return Config{}, fmt.Errorf("%w: LLM tasks require %s; create it like:\n%s",
+				ErrConfigMissing, path, configExample)
 		}
-		return Config{}, err
+		return Config{}, fmt.Errorf("read %s: %w", path, err)
 	}
 	var cfg Config
 	if err := json.Unmarshal(StripBOM(data), &cfg); err != nil {
-		return Config{}, fmt.Errorf("parse %s: %w", path, err)
+		return Config{}, fmt.Errorf("%w: parse %s: %v", ErrConfigInvalid, path, err)
 	}
 	if cfg.BaseURL == "" {
-		return Config{}, fmt.Errorf("%s: base_url is required", path)
+		return Config{}, fmt.Errorf("%w: %s: base_url is required", ErrConfigInvalid, path)
 	}
 	for k := range cfg.ExtraBody {
 		if managedKeys[k] {
-			return Config{}, fmt.Errorf("%s: extra_body cannot set %q; forebay sets it per task", path, k)
+			return Config{}, fmt.Errorf("%w: %s: extra_body cannot set %q; forebay sets it per task",
+				ErrConfigInvalid, path, k)
 		}
 	}
 	return cfg, nil
@@ -83,14 +108,15 @@ type Spec struct {
 	Schema json.RawMessage `json:"schema,omitempty"` // JSON schema for structured output
 }
 
-// ParseSpec decodes a task payload.
+// ParseSpec decodes a task payload. If the payload is not valid JSON or has
+// no user prompt, the returned error wraps ErrSpecInvalid.
 func ParseSpec(payload string) (Spec, error) {
 	var s Spec
 	if err := json.Unmarshal([]byte(payload), &s); err != nil {
-		return Spec{}, fmt.Errorf("corrupt llm payload: %w", err)
+		return Spec{}, fmt.Errorf("%w: corrupt llm payload: %v", ErrSpecInvalid, err)
 	}
 	if s.User == "" {
-		return Spec{}, fmt.Errorf("llm payload has no user prompt")
+		return Spec{}, fmt.Errorf("%w: llm payload has no user prompt", ErrSpecInvalid)
 	}
 	return s, nil
 }
@@ -102,16 +128,16 @@ type Exchange struct {
 	Response []byte
 }
 
-// Call performs one chat completion and returns the assistant message
-// content plus the raw exchange (for the task log). It honors ctx
-// cancellation, which is how running LLM tasks get canceled.
+// Call performs one chat completion and returns the assistant message content
+// plus the raw exchange (for the task log). Cancellation of ctx interrupts the
+// request, which is how running LLM tasks get canceled.
 func Call(ctx context.Context, cfg Config, spec Spec) (content string, ex Exchange, err error) {
 	model := spec.Model
 	if model == "" {
 		model = cfg.Model
 	}
 	if model == "" {
-		return "", ex, fmt.Errorf("no model: set \"model\" in config.json or pass one on the task")
+		return "", ex, fmt.Errorf("%w: set \"model\" in config.json or pass one on the task", ErrNoModel)
 	}
 
 	var messages []map[string]string
@@ -139,14 +165,14 @@ func Call(ctx context.Context, cfg Config, spec Spec) (content string, ex Exchan
 	}
 	reqBody, err := json.Marshal(body)
 	if err != nil {
-		return "", ex, err
+		return "", ex, fmt.Errorf("encode request for %s: %w", urlChatCompletions(cfg.BaseURL), err)
 	}
 	ex.Request = reqBody
 
-	url := strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions"
+	url := urlChatCompletions(cfg.BaseURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
-		return "", ex, err
+		return "", ex, fmt.Errorf("build request for %s: %w", url, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if cfg.APIKey != "" {
@@ -163,13 +189,14 @@ func Call(ctx context.Context, cfg Config, spec Spec) (content string, ex Exchan
 		return "", ex, fmt.Errorf("POST %s: %w", url, err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	ex.Response = raw
-	if err != nil {
-		return "", ex, fmt.Errorf("read response from %s: %w", url, err)
+	if readErr != nil {
+		return "", ex, fmt.Errorf("read response from %s: %w", url, readErr)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return "", ex, fmt.Errorf("POST %s: %s: %s", url, resp.Status, truncate(string(raw), 500))
+		return "", ex, fmt.Errorf("%w: POST %s: %s: %s", ErrBadStatus, url, resp.Status,
+			truncate(string(raw), maxErrorBody))
 	}
 
 	var parsed struct {
@@ -186,6 +213,14 @@ func Call(ctx context.Context, cfg Config, spec Spec) (content string, ex Exchan
 		return "", ex, fmt.Errorf("response from %s has no choices", url)
 	}
 	return parsed.Choices[0].Message.Content, ex, nil
+}
+
+// maxErrorBody caps how much of an error response body is quoted back.
+const maxErrorBody = 500
+
+// urlChatCompletions returns the chat completions endpoint for a base URL.
+func urlChatCompletions(baseURL string) string {
+	return strings.TrimRight(baseURL, "/") + "/chat/completions"
 }
 
 // truncate shortens s to at most n characters, appending "..." if truncated.

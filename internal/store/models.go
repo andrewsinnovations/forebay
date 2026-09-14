@@ -15,6 +15,8 @@ const (
 	StatusCanceled = "canceled"
 )
 
+// A Batch is a named group of tasks that share a working directory and
+// environment.
 type Batch struct {
 	ID        string
 	Name      string
@@ -29,6 +31,8 @@ const (
 	KindLLM  = "llm"
 )
 
+// A Task is one queued unit of work: either an argv array to execute (Kind
+// is KindExec) or an LLM request payload (Kind is KindLLM).
 type Task struct {
 	Seq             int64
 	ID              string
@@ -65,10 +69,14 @@ func (s BatchStatus) Total() int {
 	return s.Pending + s.Running + s.Done + s.Failed + s.Canceled
 }
 
-// NewID returns a short random hex ID. Short on purpose: IDs appear in
-// log file paths and Windows caps unprefixed paths at 260 chars.
+// idBytes is the entropy of a task or batch ID. Short on purpose: IDs appear
+// in log file paths, and Windows caps unprefixed paths at 260 chars.
+const idBytes = 4
+
+// NewID returns a short random hex ID. It panics only if the system source of
+// randomness fails, which is unrecoverable.
 func NewID() string {
-	b := make([]byte, 4)
+	b := make([]byte, idBytes)
 	if _, err := rand.Read(b); err != nil {
 		panic(err) // crypto/rand failure is unrecoverable
 	}

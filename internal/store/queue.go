@@ -10,29 +10,50 @@ import (
 )
 
 // ErrNoTask is returned by Claim when the queue has no pending work.
-var ErrNoTask = errors.New("no pending tasks")
+var ErrNoTask = errors.New("store: no pending tasks")
+
+// ErrBatchNotFound reports that no batch matches the requested name or ID.
+var ErrBatchNotFound = errors.New("store: batch not found")
+
+// ErrTaskNotFound reports that no task matches the requested ID.
+var ErrTaskNotFound = errors.New("store: task not found")
+
+// ErrNothingSelected reports a mutation whose filters matched nothing to act on.
+var ErrNothingSelected = errors.New("store: nothing selected")
+
+// ErrEmptyCommand reports an argv with nothing to run.
+var ErrEmptyCommand = errors.New("store: empty command")
+
+// ErrNotRunning reports an operation on a task that is no longer running.
+var ErrNotRunning = errors.New("store: task is not running")
+
+// requeueSet resets a claimed task back to pending; used both by Requeue and
+// by ReclaimStale so the two cannot drift apart.
+const requeueSet = `status = 'pending', runner = NULL, claimed_at = NULL,
+		heartbeat_at = NULL, started_at = NULL, result = NULL, cancel_requested = 0`
 
 // EnsureBatch returns the batch with the given name, creating it if necessary.
-// On creation, the current working directory and environment are captured.
+// On creation, workdir and env are captured; an empty workdir means "use the
+// process working directory" and an empty name means "default".
 func (d *DB) EnsureBatch(name, workdir string, env []string) (Batch, error) {
 	if name == "" {
 		name = "default"
 	}
 	envJSON, err := json.Marshal(env)
 	if err != nil {
-		return Batch{}, err
+		return Batch{}, fmt.Errorf("encode env for batch %q: %w", name, err)
 	}
-	id := NewID()
 	_, err = d.Exec(`INSERT INTO batches (id, name, created_at, workdir, env)
 		VALUES (?, ?, ?, ?, ?) ON CONFLICT(name) DO NOTHING`,
-		id, name, now(), workdir, string(envJSON))
+		NewID(), name, now(), workdir, string(envJSON))
 	if err != nil {
 		return Batch{}, fmt.Errorf("ensure batch %q: %w", name, err)
 	}
 	return d.GetBatch(name)
 }
 
-// GetBatch resolves a batch by name or ID.
+// GetBatch resolves a batch by name or ID. If no batch matches, the returned
+// error wraps ErrBatchNotFound.
 func (d *DB) GetBatch(nameOrID string) (Batch, error) {
 	row := d.QueryRow(`SELECT id, name, created_at, workdir, env
 		FROM batches WHERE name = ? OR id = ?`, nameOrID, nameOrID)
@@ -40,9 +61,9 @@ func (d *DB) GetBatch(nameOrID string) (Batch, error) {
 	var envJSON string
 	if err := row.Scan(&b.ID, &b.Name, &b.CreatedAt, &b.Workdir, &envJSON); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return Batch{}, fmt.Errorf("no batch named %q", nameOrID)
+			return Batch{}, fmt.Errorf("%w: %q", ErrBatchNotFound, nameOrID)
 		}
-		return Batch{}, err
+		return Batch{}, fmt.Errorf("query batch %q: %w", nameOrID, err)
 	}
 	if err := json.Unmarshal([]byte(envJSON), &b.Env); err != nil {
 		return Batch{}, fmt.Errorf("batch %q has corrupt env: %w", b.Name, err)
@@ -50,37 +71,38 @@ func (d *DB) GetBatch(nameOrID string) (Batch, error) {
 	return b, nil
 }
 
-// AddTask queues one command on the given batch.
+// AddTask queues one command on the given batch and returns the new task ID.
+// An empty argv is reported with ErrEmptyCommand.
 func (d *DB) AddTask(batchID string, argv []string) (string, error) {
 	if len(argv) == 0 || argv[0] == "" {
-		return "", errors.New("empty command")
+		return "", ErrEmptyCommand
 	}
 	argvJSON, err := json.Marshal(argv)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("encode command: %w", err)
 	}
 	id := NewID()
-	_, err = d.Exec(`INSERT INTO tasks (id, batch_id, argv) VALUES (?, ?, ?)`,
-		id, batchID, string(argvJSON))
-	if err != nil {
+	if _, err := d.Exec(`INSERT INTO tasks (id, batch_id, argv) VALUES (?, ?, ?)`,
+		id, batchID, string(argvJSON)); err != nil {
 		return "", fmt.Errorf("queue task: %w", err)
 	}
 	return id, nil
 }
 
-// AddLLMTask queues an LLM call with the given payload.
+// AddLLMTask queues an LLM call with the given payload and returns the new
+// task ID.
 func (d *DB) AddLLMTask(batchID, payload string) (string, error) {
 	id := NewID()
-	_, err := d.Exec(`INSERT INTO tasks (id, batch_id, kind, argv, payload)
-		VALUES (?, ?, 'llm', '[]', ?)`, id, batchID, payload)
-	if err != nil {
+	if _, err := d.Exec(`INSERT INTO tasks (id, batch_id, kind, argv, payload)
+		VALUES (?, ?, 'llm', '[]', ?)`, id, batchID, payload); err != nil {
 		return "", fmt.Errorf("queue llm task: %w", err)
 	}
 	return id, nil
 }
 
 // Claim atomically takes the oldest pending task for the given runner,
-// optionally filtered by batch.
+// optionally filtered by batch name or ID. When the queue holds no pending
+// work, Claim returns an error wrapping ErrNoTask.
 func (d *DB) Claim(runnerID, batch string) (*Task, error) {
 	q := `UPDATE tasks SET status = 'running', runner = ?, claimed_at = ?, heartbeat_at = ?
 		WHERE seq = (SELECT seq FROM tasks WHERE status = 'pending'`
@@ -95,11 +117,10 @@ func (d *DB) Claim(runnerID, batch string) (*Task, error) {
 	var t Task
 	var argvJSON string
 	var cancel int
-	err := row.Scan(&t.Seq, &t.ID, &t.BatchID, &t.Kind, &argvJSON, &t.Payload, &cancel)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNoTask
-	}
-	if err != nil {
+	if err := row.Scan(&t.Seq, &t.ID, &t.BatchID, &t.Kind, &argvJSON, &t.Payload, &cancel); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNoTask
+		}
 		return nil, fmt.Errorf("claim task: %w", err)
 	}
 	if err := json.Unmarshal([]byte(argvJSON), &t.Argv); err != nil {
@@ -110,152 +131,160 @@ func (d *DB) Claim(runnerID, batch string) (*Task, error) {
 	return &t, nil
 }
 
-// Touch refreshes a running task's heartbeat and reports whether
-// cancellation has been requested since the last touch.
+// Touch refreshes a running task's heartbeat and reports whether cancellation
+// has been requested since the last touch. If the task is no longer running,
+// the returned error wraps ErrNotRunning.
 func (d *DB) Touch(taskID string) (cancelRequested bool, err error) {
 	row := d.QueryRow(`UPDATE tasks SET heartbeat_at = ? WHERE id = ? AND status = 'running'
 		RETURNING cancel_requested`, now(), taskID)
 	var cancel int
 	if err := row.Scan(&cancel); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return false, fmt.Errorf("task %s is no longer running", taskID)
+			return false, fmt.Errorf("%w: task %s is no longer running", ErrNotRunning, taskID)
 		}
-		return false, err
+		return false, fmt.Errorf("touch task %s: %w", taskID, err)
 	}
 	return cancel != 0, nil
 }
 
 // MarkStarted records the exec start time and log location.
 func (d *DB) MarkStarted(taskID, logPath string) error {
-	_, err := d.Exec(`UPDATE tasks SET started_at = ?, log_path = ? WHERE id = ?`,
-		now(), logPath, taskID)
-	return err
+	if _, err := d.Exec(`UPDATE tasks SET started_at = ?, log_path = ? WHERE id = ?`,
+		now(), logPath, taskID); err != nil {
+		return fmt.Errorf("mark task %s started: %w", taskID, err)
+	}
+	return nil
 }
 
-// MarkFinished settles a task into done/failed/canceled. result is the
-// task's saved output: the model reply for llm tasks, the captured
-// stdout+stderr for exec tasks.
+// MarkFinished settles a task into done, failed, or canceled. result is the
+// task's saved output: the model reply for LLM tasks, the captured
+// stdout and stderr for exec tasks.
 func (d *DB) MarkFinished(taskID, status string, exitCode int, errMsg, result string) error {
-	_, err := d.Exec(`UPDATE tasks SET status = ?, finished_at = ?, exit_code = ?, error = ?,
-		result = ? WHERE id = ?`, status, now(), exitCode, errMsg, result, taskID)
-	return err
+	if _, err := d.Exec(`UPDATE tasks SET status = ?, finished_at = ?, exit_code = ?, error = ?,
+		result = ? WHERE id = ?`, status, now(), exitCode, errMsg, result, taskID); err != nil {
+		return fmt.Errorf("mark task %s finished: %w", taskID, err)
+	}
+	return nil
 }
 
-// Requeue puts a claimed task back to pending (used when a runner is
-// interrupted mid-task, so the work is retried on the next run).
+// Requeue puts a claimed task back to pending, so an interrupted run retries
+// the work on the next pass.
 func (d *DB) Requeue(taskID string) error {
-	_, err := d.Exec(`UPDATE tasks SET status = 'pending', runner = NULL, claimed_at = NULL,
-		heartbeat_at = NULL, started_at = NULL, result = NULL, cancel_requested = 0
-		WHERE id = ?`, taskID)
-	return err
+	if _, err := d.Exec(`UPDATE tasks SET `+requeueSet+` WHERE id = ?`, taskID); err != nil {
+		return fmt.Errorf("requeue task %s: %w", taskID, err)
+	}
+	return nil
 }
 
-// ReclaimStale requeues running tasks whose heartbeat expired.
+// ReclaimStale requeues running tasks whose heartbeat is older than the given
+// duration and returns how many were reclaimed.
 func (d *DB) ReclaimStale(olderThan time.Duration) (int64, error) {
 	cutoff := time.Now().UTC().Add(-olderThan).Format(time.RFC3339)
-	res, err := d.Exec(`UPDATE tasks SET status = 'pending', runner = NULL, claimed_at = NULL,
-		heartbeat_at = NULL, started_at = NULL, result = NULL, cancel_requested = 0
+	res, err := d.Exec(`UPDATE tasks SET `+requeueSet+`
 		WHERE status = 'running' AND (heartbeat_at IS NULL OR heartbeat_at < ?)`, cutoff)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("reclaim stale tasks: %w", err)
 	}
 	return res.RowsAffected()
 }
 
-// Reset requeues tasks by status class.
+// Reset requeues tasks by status class: always running tasks, plus failed ones
+// when failed is set, and everything but done when all is set.
 func (d *DB) Reset(failed, all bool) (int64, error) {
-	var conds []string
-	if all {
-		conds = []string{"status IN ('running', 'failed', 'canceled')"}
-	} else {
-		conds = append(conds, "status = 'running'")
+	conds := []string{"status = 'running'"}
+	if !all {
 		if failed {
 			conds = append(conds, "status = 'failed'")
 		}
+	} else {
+		conds = []string{"status IN ('running', 'failed', 'canceled')"}
 	}
 	res, err := d.Exec(`UPDATE tasks SET status = 'pending', runner = NULL, claimed_at = NULL,
 		heartbeat_at = NULL, started_at = NULL, finished_at = NULL, exit_code = NULL,
 		error = NULL, result = NULL, cancel_requested = 0 WHERE ` + strings.Join(conds, " OR "))
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("reset tasks: %w", err)
 	}
 	return res.RowsAffected()
 }
 
-// Cancel marks pending tasks as canceled and requests cancellation of
-// running tasks.
+// Cancel marks pending tasks as canceled and requests cancellation of running
+// tasks. Exactly one of taskID, batchID, or all must select the targets;
+// otherwise the returned error wraps ErrNothingSelected.
 func (d *DB) Cancel(taskID, batchID string, all bool) (int64, error) {
-	where := ""
+	var where string
 	var args []any
 	switch {
 	case taskID != "":
-		where = "id = ?"
-		args = []any{taskID}
+		where, args = "id = ?", []any{taskID}
 	case batchID != "":
-		where = "batch_id = ?"
-		args = []any{batchID}
+		where, args = "batch_id = ?", []any{batchID}
 	case all:
 		where = "1=1"
 	default:
-		return 0, errors.New("nothing selected to cancel")
+		return 0, fmt.Errorf("%w: cancel needs a task ID, a batch, or --all", ErrNothingSelected)
 	}
 	res, err := d.Exec(`UPDATE tasks SET
 		status = CASE WHEN status = 'pending' THEN 'canceled' ELSE status END,
 		cancel_requested = CASE WHEN status = 'running' THEN 1 ELSE cancel_requested END
 		WHERE (status = 'pending' OR status = 'running') AND `+where, args...)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("cancel tasks: %w", err)
 	}
 	return res.RowsAffected()
 }
 
-// Clean deletes finished tasks and returns their log paths.
+// Clean deletes finished tasks and returns their log paths so the caller can
+// remove the files. With all set, pending tasks are deleted too; running tasks
+// are never deleted. It also drops batches left without tasks.
 func (d *DB) Clean(batchID string, all bool) (logPaths []string, deleted int64, err error) {
 	statuses := `('done', 'failed', 'canceled')`
 	if all {
 		statuses = `('done', 'failed', 'canceled', 'pending')`
 	}
-	q := `SELECT COALESCE(log_path, '') FROM tasks WHERE status IN ` + statuses
+	selectQ := `SELECT COALESCE(log_path, '') FROM tasks WHERE status IN ` + statuses
+	deleteQ := `DELETE FROM tasks WHERE status IN ` + statuses
 	var args []any
 	if batchID != "" {
-		q += ` AND batch_id = ?`
+		clause := ` AND batch_id = ?`
+		selectQ += clause
+		deleteQ += clause
 		args = append(args, batchID)
 	}
-	rows, err := d.Query(q, args...)
+
+	rows, err := d.Query(selectQ, args...)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("select tasks to clean: %w", err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var p string
 		if err := rows.Scan(&p); err != nil {
-			rows.Close()
-			return nil, 0, err
+			return nil, 0, fmt.Errorf("scan task log path: %w", err)
 		}
 		if p != "" {
 			logPaths = append(logPaths, p)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("iterate tasks to clean: %w", err)
 	}
-	rows.Close()
+	// Close before the DELETE so SQLite does not hold a read transaction open.
+	if err := rows.Close(); err != nil {
+		return nil, 0, fmt.Errorf("close task rows: %w", err)
+	}
 
-	del := `DELETE FROM tasks WHERE status IN ` + statuses
-	if batchID != "" {
-		del += ` AND batch_id = ?`
-	}
-	res, err := d.Exec(del, args...)
+	res, err := d.Exec(deleteQ, args...)
 	if err != nil {
-		return nil, 0, err
+		return logPaths, 0, fmt.Errorf("delete cleaned tasks: %w", err)
 	}
 	deleted, err = res.RowsAffected()
 	if err != nil {
-		return nil, 0, err
+		return logPaths, deleted, fmt.Errorf("count cleaned tasks: %w", err)
 	}
 	if _, err := d.Exec(`DELETE FROM batches WHERE NOT EXISTS
 		(SELECT 1 FROM tasks t WHERE t.batch_id = batches.id)`); err != nil {
-		return logPaths, deleted, err
+		return logPaths, deleted, fmt.Errorf("drop empty batches: %w", err)
 	}
 	return logPaths, deleted, nil
 }
@@ -271,7 +300,7 @@ func (d *DB) Status() ([]BatchStatus, error) {
 		FROM batches b LEFT JOIN tasks t ON t.batch_id = b.id
 		GROUP BY b.id ORDER BY b.created_at, b.id`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query batch statuses: %w", err)
 	}
 	defer rows.Close()
 	var out []BatchStatus
@@ -280,17 +309,20 @@ func (d *DB) Status() ([]BatchStatus, error) {
 		var p, r, dn, f, c sql.NullInt64
 		if err := rows.Scan(&s.Batch.ID, &s.Batch.Name, &s.Batch.CreatedAt, &s.Batch.Workdir,
 			&p, &r, &dn, &f, &c); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan batch status: %w", err)
 		}
 		s.Pending, s.Running, s.Done, s.Failed, s.Canceled =
 			int(p.Int64), int(r.Int64), int(dn.Int64), int(f.Int64), int(c.Int64)
 		out = append(out, s)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate batch statuses: %w", err)
+	}
+	return out, nil
 }
 
-// ListTasks returns tasks, optionally filtered by batch, status, and/or
-// kind, oldest first.
+// ListTasks returns tasks oldest first, optionally filtered by batch ID, task
+// status, and task kind. A limit of zero or less means no limit.
 func (d *DB) ListTasks(batchID, status, kind string, limit int) ([]Task, error) {
 	q := taskSelect + ` WHERE 1=1`
 	var args []any
@@ -394,24 +426,29 @@ const taskSelect = `SELECT t.seq, t.id, t.batch_id, b.name, t.kind, t.argv,
 	COALESCE(t.error, ''), COALESCE(t.log_path, ''), t.cancel_requested
 	FROM tasks t JOIN batches b ON b.id = t.batch_id`
 
-// GetTask resolves one task by ID.
+// GetTask resolves one task by ID. If no task matches, the returned error
+// wraps ErrTaskNotFound.
 func (d *DB) GetTask(id string) (Task, error) {
-	rows, err := d.Query(taskSelect+` WHERE t.id = ?`, id)
+	row := d.QueryRow(taskSelect+` WHERE t.id = ?`, id)
+	t, err := scanTask(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Task{}, fmt.Errorf("%w: %q", ErrTaskNotFound, id)
+	}
 	if err != nil {
-		return Task{}, err
+		return Task{}, fmt.Errorf("get task %s: %w", id, err)
 	}
-	defer rows.Close()
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return Task{}, err
-		}
-		return Task{}, fmt.Errorf("no task with id %q", id)
-	}
-	return scanTask(rows)
+	return t, nil
 }
 
-// scanTask deserializes a task row from the database.
-func scanTask(rows *sql.Rows) (Task, error) {
+// rowScanner covers both *sql.Row and *sql.Rows so one scan helper serves
+// single-row and multi-row queries.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanTask deserializes one task row. If no row is available, it returns an
+// error wrapping sql.ErrNoRows.
+func scanTask(rows rowScanner) (Task, error) {
 	var t Task
 	var argvJSON string
 	var exit sql.NullInt64

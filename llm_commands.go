@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -35,7 +36,7 @@ func addLLMFlags(fs *flag.FlagSet) llmFlags {
 // resolve validates the flag combination and returns the system prompt and schema.
 func (f llmFlags) resolve() (system string, schema json.RawMessage, err error) {
 	if *f.system != "" && *f.systemFile != "" {
-		return "", nil, fmt.Errorf("--system and --system-file are mutually exclusive")
+		return "", nil, errors.New("--system and --system-file are mutually exclusive")
 	}
 	system = *f.system
 	if *f.systemFile != "" {
@@ -46,7 +47,7 @@ func (f llmFlags) resolve() (system string, schema json.RawMessage, err error) {
 		system = string(llm.StripBOM(data))
 	}
 	if *f.schema != "" && *f.schemaFile != "" {
-		return "", nil, fmt.Errorf("--schema and --schema-file are mutually exclusive")
+		return "", nil, errors.New("--schema and --schema-file are mutually exclusive")
 	}
 	raw := *f.schema
 	if *f.schemaFile != "" {
@@ -100,17 +101,17 @@ func describeSchema(schema json.RawMessage) string {
 
 // requireConfig verifies the LLM configuration is present and valid.
 func requireConfig(db *store.DB, modelOverride string) error {
-	cfg, err := llm.LoadConfig(db.HomeDir())
+	cfg, err := llm.LoadConfig(db.Home())
 	if err != nil {
 		return err
 	}
 	if cfg.Model == "" && modelOverride == "" {
-		return fmt.Errorf("no model: set \"model\" in %s or pass --model", llm.ConfigPath(db.HomeDir()))
+		return fmt.Errorf("no model: set \"model\" in %s or pass --model", llm.ConfigPath(db.Home()))
 	}
 	return nil
 }
 
-// specJSON serializes an LLM spec to JSON string.
+// specJSON serializes an LLM spec to a JSON string.
 func specJSON(model, system, user string, schema json.RawMessage) (string, error) {
 	b, err := json.Marshal(llm.Spec{Model: model, System: system, User: user, Schema: schema})
 	if err != nil {
@@ -119,23 +120,23 @@ func specJSON(model, system, user string, schema json.RawMessage) (string, error
 	return string(b), nil
 }
 
-// cmdAddLLM handles the 'add-llm' subcommand.
-func cmdAddLLM(args []string) error {
-	flagArgs, prompt := splitAtDashDash(args)
+// addLLM queues a single LLM task onto a batch.
+func addLLM(args []string) error {
+	flagArgs, prompt := splitArgs(args)
 	fs := flag.NewFlagSet("add-llm", flag.ExitOnError)
 	batchName := fs.String("batch", "default", "batch name to queue onto (created if missing)")
 	dir := fs.String("dir", "", "working directory for the batch (default: current directory; only applies on batch creation)")
 	lf := addLLMFlags(fs)
 	fs.Parse(flagArgs)
 	if len(prompt) == 0 {
-		return fmt.Errorf("no user prompt given; usage: forebay add-llm [flags] -- USER PROMPT...")
+		return errors.New("no user prompt given; usage: forebay add-llm [flags] -- USER PROMPT...")
 	}
 	warnPromptFlags(prompt)
 	system, schema, err := lf.resolve()
 	if err != nil {
 		return err
 	}
-	db, err := openDB()
+	db, err := store.Open()
 	if err != nil {
 		return err
 	}
@@ -163,9 +164,9 @@ func cmdAddLLM(args []string) error {
 	return nil
 }
 
-// cmdBatchLLM handles the 'batch-llm' subcommand for queueing LLM tasks over files matching glob patterns.
-func cmdBatchLLM(args []string) error {
-	flagArgs, template := splitAtDashDash(args)
+// batchLLM queues one LLM task per file matching the glob patterns.
+func batchLLM(args []string) error {
+	flagArgs, template := splitArgs(args)
 	fs := flag.NewFlagSet("batch-llm", flag.ExitOnError)
 	name := fs.String("name", "", "batch name (default: batch-<id>)")
 	dir := fs.String("dir", "", "root directory for glob expansion (default: current directory)")
@@ -176,10 +177,10 @@ func cmdBatchLLM(args []string) error {
 	lf := addLLMFlags(fs)
 	fs.Parse(flagArgs)
 	if len(globs) == 0 {
-		return fmt.Errorf("at least one --glob is required")
+		return errors.New("at least one --glob is required")
 	}
 	if len(template) == 0 {
-		return fmt.Errorf("no user prompt template given after --")
+		return errors.New("no user prompt template given after --")
 	}
 	warnPromptFlags(template)
 	system, schema, err := lf.resolve()
@@ -214,7 +215,7 @@ func cmdBatchLLM(args []string) error {
 		fmt.Printf("(%d llm tasks; dry run, nothing queued)\n", len(files))
 		return nil
 	}
-	db, err := openDB()
+	db, err := store.Open()
 	if err != nil {
 		return err
 	}

@@ -3,6 +3,7 @@
 package runner
 
 import (
+	"fmt"
 	"os/exec"
 	"syscall"
 	"unsafe"
@@ -18,10 +19,9 @@ func setupProcAttr(cmd *exec.Cmd) {
 	}
 }
 
-// procTree wraps a Job Object holding the child and all its
-// descendants. TerminateJobObject is the only reliable way to kill a
-// full process tree on Windows — TerminateProcess kills exactly one
-// process and orphans the rest.
+// procTree tracks a child process and all its descendants in a Job Object.
+// TerminateJobObject is the only reliable way to kill a full process tree on
+// Windows: TerminateProcess kills exactly one process and orphans the rest.
 type procTree struct {
 	job windows.Handle
 	pid uint32
@@ -43,35 +43,35 @@ func newProcTree(cmd *exec.Cmd) (*procTree, error) {
 		windows.JobObjectExtendedLimitInformation,
 		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
 		windows.CloseHandle(job)
-		return nil, err
+		return nil, fmt.Errorf("configure job object: %w", err)
 	}
 	pid := uint32(cmd.Process.Pid)
 	proc, err := windows.OpenProcess(
 		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, pid)
 	if err != nil {
 		windows.CloseHandle(job)
-		return nil, err
+		return nil, fmt.Errorf("open process %d: %w", pid, err)
 	}
 	defer windows.CloseHandle(proc)
 	if err := windows.AssignProcessToJobObject(job, proc); err != nil {
 		windows.CloseHandle(job)
-		return nil, err
+		return nil, fmt.Errorf("assign process %d to job object: %w", pid, err)
 	}
 	return &procTree{job: job, pid: pid}, nil
 }
 
-// Terminate attempts a soft stop. Windows has no SIGTERM; CTRL_BREAK to
-// the child's process group is the closest thing, and only console apps
-// that handle it will exit gracefully. The runner follows up with
-// Kill() after the grace period regardless.
+// Terminate attempts a soft stop by sending CTRL_BREAK to the child's process
+// group. Windows has no SIGTERM, so only console apps that handle CTRL_BREAK
+// will exit gracefully; the runner follows up with Kill after the grace period
+// regardless. The event's error is not reportable: cancellation proceeds either
+// way.
 func (t *procTree) Terminate() {
-	windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, t.pid)
+	_ = windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, t.pid)
 }
 
-// Kill terminates every process in the job, transitively.
-func (t *procTree) Kill() {
-	windows.TerminateJobObject(t.job, 1)
-}
+// Kill terminates every process in the job, transitively. A job that is
+// already empty is not an error worth surfacing.
+func (t *procTree) Kill() { _ = windows.TerminateJobObject(t.job, 1) }
 
 // Close releases the Job Object handle.
 func (t *procTree) Close() {

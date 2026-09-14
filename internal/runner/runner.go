@@ -1,7 +1,7 @@
-// Package runner drains the queue: it claims tasks atomically, executes
-// them as direct process spawns (no shell), heartbeats while they run,
-// and kills whole process trees on cancellation — process groups on
-// Unix, Job Objects on Windows (see proc_*.go).
+// Package runner drains the forebay queue: it claims tasks atomically,
+// executes them as direct process spawns (never through a shell), heartbeats
+// while they run, and kills whole process trees on cancellation — process
+// groups on Unix, Job Objects on Windows (see proc_*.go).
 package runner
 
 import (
@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,51 +21,67 @@ import (
 )
 
 const (
+	// heartbeatEvery is how often a running task refreshes its heartbeat.
 	heartbeatEvery = 5 * time.Second
-	staleAfter     = 60 * time.Second
-	// gracePeriod is the duration between requesting cancellation
-	// and forcibly terminating the process tree.
+	// staleAfter is the heartbeat age after which another run may reclaim a
+	// task left in the running state by a crashed runner.
+	staleAfter = 60 * time.Second
+	// gracePeriod is how long a canceled task's process tree has to exit
+	// after being asked to terminate before it is killed outright.
 	gracePeriod = 5 * time.Second
+	// defaultInterval is the poll interval used in watch mode when Options
+	// leaves Interval unset.
+	defaultInterval = 5 * time.Second
+	// maxArgLen is the length beyond which a single command argument is
+	// elided in status output.
+	maxArgLen = 60
 )
 
+// Options configures a call to Run. Zero values select the defaults noted per
+// field.
 type Options struct {
-	// Workers is the number of parallel task slots; 1 means sequential execution.
+	// Workers is the number of tasks to run in parallel; 1 runs sequentially.
 	Workers int
 	// Batch restricts execution to a single batch by name or ID.
 	// Empty means process tasks from all batches.
 	Batch string
 	// Watch keeps polling for new tasks after the queue drains.
 	Watch bool
-	// Interval is the poll interval when in watch mode.
+	// Interval is the poll interval in watch mode; zero selects 5s.
 	Interval time.Duration
 }
 
-// Run drains the queue until empty or interrupted. In watch mode it
-// polls forever. Returns once all claimed work is settled.
-func Run(db *store.DB, opts Options) error {
+// Run drains the queue until it empties, ctx is canceled, or the process is
+// interrupted. In watch mode it polls until interrupted. Run returns once all
+// claimed work has settled: each task ends done, failed, canceled, or requeued
+// for the next run.
+func Run(ctx context.Context, db *store.DB, opts Options) error {
 	if opts.Workers < 1 {
 		opts.Workers = 1
 	}
 	if opts.Interval <= 0 {
-		opts.Interval = 5 * time.Second
+		opts.Interval = defaultInterval
 	}
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+	defer stop()
 
-	if n, err := db.ReclaimStale(staleAfter); err != nil {
-		return err
-	} else if n > 0 {
+	n, err := db.ReclaimStale(staleAfter)
+	if err != nil {
+		return fmt.Errorf("reclaim stale tasks: %w", err)
+	}
+	if n > 0 {
 		fmt.Printf("reclaimed %d stale task(s) from a previous run\n", n)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
-	runnerID := runnerID()
+	// One identity is shared by every worker so a task claimed by this
+	// process can be attributed to it in the database.
+	id := newRunnerID()
 	var wg sync.WaitGroup
-	for i := 0; i < opts.Workers; i++ {
+	for range opts.Workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			workerLoop(ctx, db, runnerID, opts)
+			work(ctx, db, id, opts)
 		}()
 	}
 	wg.Wait()
@@ -74,24 +91,27 @@ func Run(db *store.DB, opts Options) error {
 	return nil
 }
 
-// runnerID returns a unique identifier for this runner instance.
-func runnerID() string {
+// newRunnerID returns an identifier unique to this forebay process.
+func newRunnerID() string {
 	host, err := os.Hostname()
-	if err != nil {
+	if err != nil { // fall back to the PID alone, which is still process-unique
 		host = "unknown"
 	}
 	return fmt.Sprintf("%s-%d", host, os.Getpid())
 }
 
-// workerLoop claims and executes tasks until the context is canceled
-// or the queue is empty (in non-watch mode).
-func workerLoop(ctx context.Context, db *store.DB, runnerID string, opts Options) {
+// work claims and executes tasks until ctx is canceled, or until the queue is
+// empty when opts.Watch is false. Claim failures are reported and end the
+// worker: a queue that cannot be read will not become readable by trying
+// again.
+func work(ctx context.Context, db *store.DB, runnerID string, opts Options) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		task, err := db.Claim(runnerID, opts.Batch)
-		if errors.Is(err, store.ErrNoTask) {
+		switch {
+		case errors.Is(err, store.ErrNoTask):
 			if !opts.Watch {
 				return
 			}
@@ -101,37 +121,34 @@ func workerLoop(ctx context.Context, db *store.DB, runnerID string, opts Options
 			case <-time.After(opts.Interval):
 				continue
 			}
-		}
-		if err != nil {
+		case err != nil:
 			fmt.Fprintf(os.Stderr, "claim failed: %v\n", err)
 			return
 		}
+		// Tee only a solo worker's output: with several workers the lines
+		// interleave into noise, and the log file holds everything anyway.
+		tee := opts.Workers == 1
 		if task.Kind == store.KindLLM {
-			executeLLMTask(ctx, db, task, opts.Workers == 1)
+			runLLMTask(ctx, db, task, tee)
 		} else {
-			executeTask(ctx, db, task, opts.Workers == 1)
+			runTask(ctx, db, task, tee)
 		}
 	}
 }
 
-// executeTask runs one claimed task to a terminal status. Every exit
-// path settles the row: done/failed/canceled, or requeued on interrupt.
-func executeTask(ctx context.Context, db *store.DB, task *store.Task, tee bool) {
+// runTask executes one claimed task and settles its row to a terminal status.
+// Every exit path settles the row: done, failed, or canceled, or requeued when
+// ctx is canceled mid-task. With tee set, the task's output is also copied to
+// stdout.
+func runTask(ctx context.Context, db *store.DB, task *store.Task, tee bool) {
 	batch, err := db.GetBatch(task.BatchID)
 	if err != nil {
-		db.MarkFinished(task.ID, store.StatusFailed, -1, err.Error(), "")
+		fail(db, task, fmt.Errorf("look up batch: %w", err))
 		return
 	}
-
-	logDir := filepath.Join(db.LogsDir(), batch.ID)
-	if err := os.MkdirAll(logDir, 0o700); err != nil {
-		db.MarkFinished(task.ID, store.StatusFailed, -1, fmt.Sprintf("create log dir: %v", err), "")
-		return
-	}
-	logPath := filepath.Join(logDir, task.ID+".log")
-	logFile, err := os.Create(logPath)
+	logFile, logPath, err := createLog(db.LogsDir(), batch.ID, task.ID)
 	if err != nil {
-		db.MarkFinished(task.ID, store.StatusFailed, -1, fmt.Sprintf("create log file: %v", err), "")
+		fail(db, task, err)
 		return
 	}
 	defer logFile.Close()
@@ -145,23 +162,24 @@ func executeTask(ctx context.Context, db *store.DB, task *store.Task, tee bool) 
 	if tee {
 		out = io.MultiWriter(logFile, os.Stdout)
 	}
-	cmd.Stdout = out
-	cmd.Stderr = out
-	cmd.Stdin = nil
+	cmd.Stdout, cmd.Stderr, cmd.Stdin = out, out, nil
 	setupProcAttr(cmd)
 
-	fmt.Printf("[%s/%s] start: %s\n", batch.Name, task.ID, displayCommand(task.Argv))
+	fmt.Printf("[%s/%s] start: %s\n", batch.Name, task.ID, formatArgv(task.Argv))
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
-		db.MarkFinished(task.ID, store.StatusFailed, -1, fmt.Sprintf("spawn: %v", err), "")
+		fail(db, task, fmt.Errorf("spawn %q: %w", task.Argv[0], err))
 		fmt.Printf("[%s/%s] failed to start: %v\n", batch.Name, task.ID, err)
 		return
 	}
-	db.MarkStarted(task.ID, logPath)
+	if err := db.MarkStarted(task.ID, logPath); err != nil {
+		fmt.Fprintf(os.Stderr, "[%s/%s] %v\n", batch.Name, task.ID, err)
+	}
 
 	tree, err := newProcTree(cmd)
 	if err != nil {
-		// Tree tracking failed; we can still manage the direct child.
+		// Tree tracking is unavailable, but the direct child can still be
+		// signaled, so keep running the task.
 		fmt.Fprintf(os.Stderr, "[%s/%s] warning: process tree tracking unavailable: %v\n",
 			batch.Name, task.ID, err)
 	}
@@ -178,79 +196,140 @@ func executeTask(ctx context.Context, db *store.DB, task *store.Task, tee bool) 
 	for {
 		select {
 		case waitErr := <-waitCh:
-			exitCode, errMsg := 0, ""
-			status := store.StatusDone
+			exitCode, status, errMsg := 0, store.StatusDone, ""
 			if waitErr != nil {
-				status = store.StatusFailed
-				errMsg = waitErr.Error()
-				exitCode = -1
+				status, errMsg, exitCode = store.StatusFailed, waitErr.Error(), -1
 				var exitErr *exec.ExitError
 				if errors.As(waitErr, &exitErr) {
 					exitCode = exitErr.ExitCode()
 				}
 			}
-			logFile.Sync()
-			db.MarkFinished(task.ID, status, exitCode, errMsg, captureResult(logPath, resultLimit()))
+			settle(db, task, status, exitCode, errMsg, logPath)
 			fmt.Printf("[%s/%s] %s (exit %d, %s)\n",
-				batch.Name, task.ID, status, exitCode, time.Since(start).Round(time.Second))
+				batch.Name, task.ID, status, exitCode, roundSince(start))
 			return
 
 		case <-ticker.C:
-			cancel, err := db.Touch(task.ID)
+			cancelRequested, err := heartbeat(db, task.ID)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "[%s/%s] heartbeat failed: %v\n", batch.Name, task.ID, err)
+				fmt.Fprintf(os.Stderr, "[%s/%s] %v\n", batch.Name, task.ID, err)
 				continue
 			}
-			if cancel {
-				killTree(cmd, tree, waitCh)
-				logFile.Sync()
-				db.MarkFinished(task.ID, store.StatusCanceled, -1, "canceled by user",
-					captureResult(logPath, resultLimit()))
+			if cancelRequested {
+				stopTree(cmd, tree, waitCh)
+				settle(db, task, store.StatusCanceled, -1, "canceled by user", logPath)
 				fmt.Printf("[%s/%s] canceled\n", batch.Name, task.ID)
 				return
 			}
 
 		case <-ctx.Done():
-			killTree(cmd, tree, waitCh)
-			db.Requeue(task.ID)
+			stopTree(cmd, tree, waitCh)
+			requeue(db, task.ID)
 			return
 		}
 	}
 }
 
-// killTree soft-stops the task's process tree, waits out the grace
-// period, then hard-kills whatever is left and reaps the child.
-func killTree(cmd *exec.Cmd, tree *procTree, waitCh <-chan error) {
-	if tree != nil {
-		tree.Terminate()
-	} else if cmd.Process != nil {
-		cmd.Process.Signal(os.Interrupt)
+// heartbeat refreshes a running task's heartbeat and reports whether
+// cancellation has been requested. A failed heartbeat is returned as an error
+// for the caller to report; the task keeps running either way.
+func heartbeat(db *store.DB, taskID string) (cancelRequested bool, err error) {
+	cancelled, err := db.Touch(taskID)
+	if err != nil {
+		return false, fmt.Errorf("heartbeat: %w", err)
 	}
+	return cancelled, nil
+}
+
+// settle records a terminal status for task and saves its log as the result.
+func settle(db *store.DB, task *store.Task, status string, exitCode int, errMsg, logPath string) {
+	if err := db.MarkFinished(task.ID, status, exitCode, errMsg, captureResult(logPath, resultLimit())); err != nil {
+		fmt.Fprintf(os.Stderr, "task %s: %v\n", task.ID, err)
+	}
+}
+
+// fail records a startup failure for task: the task never ran, so there is no
+// exit code and no output to save.
+func fail(db *store.DB, task *store.Task, err error) {
+	if ferr := db.MarkFinished(task.ID, store.StatusFailed, -1, err.Error(), ""); ferr != nil {
+		fmt.Fprintf(os.Stderr, "task %s: %v\n", task.ID, err)
+	}
+}
+
+// requeue returns a task to the pending set after its runner was interrupted.
+func requeue(db *store.DB, taskID string) {
+	if err := db.Requeue(taskID); err != nil {
+		fmt.Fprintf(os.Stderr, "task %s: %v\n", taskID, err)
+	}
+}
+
+// createLog opens the per-task log file under root/batchID/taskID.log,
+// creating directories as needed, and returns it with its path.
+func createLog(root, batchID, taskID string) (*os.File, string, error) {
+	dir := filepath.Join(root, batchID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, "", fmt.Errorf("create log dir: %w", err)
+	}
+	path := filepath.Join(dir, taskID+".log")
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("create log file: %w", err)
+	}
+	return f, path, nil
+}
+
+// stopTree soft-stops the task's process tree, waits out the grace period,
+// then hard-kills whatever remains and reaps the child. It returns once the
+// process has exited.
+func stopTree(cmd *exec.Cmd, tree *procTree, waitCh <-chan error) {
+	signalTree(cmd, tree, true)
 	select {
 	case <-waitCh:
 		return
 	case <-time.After(gracePeriod):
 	}
-	if tree != nil {
-		tree.Kill()
-	} else if cmd.Process != nil {
-		cmd.Process.Kill()
-	}
+	signalTree(cmd, tree, false)
 	<-waitCh
 }
 
-// displayCommand formats an argument vector for logging, truncating
-// long arguments for readability.
-func displayCommand(argv []string) string {
-	s := ""
-	for i, a := range argv {
-		if i > 0 {
-			s += " "
-		}
-		if len(a) > 60 {
-			a = a[:57] + "..."
-		}
-		s += a
+// signalTree sends the graceful (soft) or fatal (hard) signal to the tracked
+// process tree, falling back to the direct child when tree tracking is
+// unavailable.
+func signalTree(cmd *exec.Cmd, tree *procTree, soft bool) {
+	switch {
+	case tree != nil && soft:
+		tree.Terminate()
+	case tree != nil:
+		tree.Kill()
+	case cmd.Process == nil:
+		// The process never started; cmd.Wait has nothing to reap.
+	case soft:
+		// Best effort: a task that ignores SIGINT is killed after the grace
+		// period.
+		_ = cmd.Process.Signal(os.Interrupt)
+	default:
+		_ = cmd.Process.Kill()
 	}
-	return s
+}
+
+// formatArgv renders an argument vector for display, eliding long arguments.
+func formatArgv(argv []string) string {
+	parts := make([]string, len(argv))
+	for i, a := range argv {
+		parts[i] = shorten(a, maxArgLen)
+	}
+	return strings.Join(parts, " ")
+}
+
+// shorten returns s, elided with a trailing ellipsis if longer than n.
+func shorten(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-3] + "..."
+}
+
+// roundSince reports the elapsed time since start, rounded for display.
+func roundSince(start time.Time) string {
+	return time.Since(start).Round(time.Second).String()
 }
