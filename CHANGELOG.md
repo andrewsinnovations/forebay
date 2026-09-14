@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0
+
+- Removed built-in LLM task support (`add-llm`, `batch-llm`, and the `internal/llm` package).
+  If you need LLM capabilities, use `forebay add` or `forebay batch` to call an existing
+  harness or CLI tool (for example, `claude -p "..."` or another OpenAI-compatible client).
+  This keeps forebay focused on command queueing and lets you choose your own LLM tooling.
+- Removed the MCP server (`forebay mcp` and the `internal/mcpserver` package).
+  Agents can queue tasks by emitting standard bash commands:
+  `forebay add --batch NAME -- COMMAND...` or `forebay batch --name NAME --glob PAT -- TEMPLATE...`.
+- Restructured project layout to follow [golang-standards/project-layout](https://github.com/golang-standards/project-layout).
+- Moved main entry point to `cmd/forebay/`.
+- Moved CLI command handlers into `internal/cli/` package.
+- Split monolithic `README.md` into focused documents under `docs/`.
+- Added `scripts/`, `build/package/`, and `docs/` directories per standard layout.
+
 ## 0.3.0
 
 - Added `summary` command for overall queue statistics.

@@ -1,5 +1,5 @@
-// forebay is a daemon-less task queue for scheduling and running commands.
-package main
+// Package cli implements the forebay command-line interface.
+package cli
 
 import (
 	"context"
@@ -12,109 +12,87 @@ import (
 	"time"
 
 	"github.com/andrewsinnovations/forebay/internal/expand"
-	"github.com/andrewsinnovations/forebay/internal/llm"
-	"github.com/andrewsinnovations/forebay/internal/mcpserver"
 	"github.com/andrewsinnovations/forebay/internal/runner"
 	"github.com/andrewsinnovations/forebay/internal/store"
 )
 
-const usage = `forebay — queue commands now, run them when you choose
+const usage = `forebay - queue commands now, run them when you choose
 
 Usage:
   forebay add    [--batch NAME] [--dir DIR] -- CMD [ARGS...]
   forebay batch  [--name NAME] --glob PATTERN [--glob ...] [--dir ROOT]
-                 [--exclude PATTERN ...] [--dry-run] -- CMD-TEMPLATE [ARGS...]
-  forebay add-llm   [--batch NAME] [--system TEXT|--system-file F]
-                    [--schema JSON|--schema-file F] [--model M] -- USER PROMPT...
-  forebay batch-llm [--name NAME] --glob PATTERN [--glob ...] [--dir ROOT]
-                    [--exclude PATTERN ...] [--system TEXT|--system-file F]
-                    [--schema JSON|--schema-file F] [--model M] [--dry-run]
-                    -- USER PROMPT TEMPLATE...
+                 [--exclude PATTERN ...] [--dry-run] [--command CMD] -- CMD-TEMPLATE [ARGS...]
   forebay run    [-j N] [--batch NAME] [--watch] [--interval SECONDS]
   forebay status
   forebay list   [--batch NAME] [--status STATUS] [--limit N]
-  forebay results [TASK_ID] [--batch NAME] [--status STATUS] [--kind exec|llm]
-                  [--contains TEXT] [--limit N] [--json]
+  forebay results [TASK_ID] [--batch NAME] [--status STATUS] [--contains TEXT]
+                  [--limit N] [--json]
   forebay logs   TASK_ID
   forebay cancel [TASK_ID] [--batch NAME] [--all]
   forebay reset  [--failed] [--all]
   forebay clean  [--batch NAME] [--all]
   forebay summary
-  forebay mcp
-
-Commands are argv arrays — forebay never invokes a shell. In batch and
-batch-llm templates, use placeholders per matched file: {path}
-{slashpath} {relpath} {name} {base} {dir}.
+Commands are argv arrays - forebay never invokes a shell. In batch
+templates, use placeholders per matched file: {path} {slashpath}
+{relpath} {name} {base} {dir}.
 
 Every task saves its output as a result: the captured stdout+stderr for
-commands, the model reply for LLM tasks. Query them with "forebay
-results" (whole log; set FOREBAY_MAX_RESULT_BYTES to cap what is stored).
-
-LLM tasks (add-llm, batch-llm) POST to the OpenAI-compatible API
-configured in ~/.forebay/config.json.
+commands. Query them with "forebay results" (whole log; set
+FOREBAY_MAX_RESULT_BYTES to cap what is stored).
 
 Example:
   forebay batch --name jsdoc --glob "src/**/*.js" -- \
     claude -p "analyze '{relpath}' and add jsdoc comments to every function"
-  forebay batch-llm --name summarize --glob "src/**/*.js" \
-    --system "You are a code summarizer." -- "Summarize {relpath}."
   forebay run -j 4
-  forebay results --batch summarize
+  forebay results --batch jsdoc
 `
 
-// openDB opens the task database.
-func openDB() (*store.DB, error) {
-	return store.Open()
-}
-
-func main() {
-	if len(os.Args) < 2 {
+// Run is the main entry point for the forebay CLI. It returns an exit code.
+func Run(args []string) int {
+	if len(args) < 1 {
 		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+		return 2
 	}
-	cmd, args := os.Args[1], os.Args[2:]
+	cmd, rest := args[0], args[1:]
 	var err error
 	switch cmd {
 	case "add":
-		err = add(args)
+		err = add(rest)
 	case "batch":
-		err = batchQueued(args)
-	case "add-llm":
-		err = addLLM(args)
-	case "batch-llm":
-		err = batchLLM(args)
+		err = batchQueued(rest)
 	case "results":
-		err = results(args)
+		err = results(rest)
 	case "run":
-		err = run(args)
+		err = run(rest)
 	case "status":
-		err = status(args)
+		err = status(rest)
 	case "list":
-		err = listTasks(args)
+		err = listTasks(rest)
 	case "logs":
-		err = logs(args)
+		err = logs(rest)
 	case "cancel":
-		err = cancel(args)
+		err = cancel(rest)
 	case "reset":
-		err = reset(args)
+		err = reset(rest)
 	case "clean":
-		err = clean(args)
-	case "mcp":
-		err = startMCPServer()
+		err = clean(rest)
 	case "summary":
-		err = summary(args)
+		err = summary(rest)
 	case "help", "-h", "--help":
 		fmt.Print(usage)
+		return 0
 	case "version", "--version":
-		fmt.Println("forebay 0.3.0")
+		fmt.Println("forebay 0.4.0")
+		return 0
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
-		os.Exit(2)
+		return 2
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "forebay %s: %v\n", cmd, err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 // splitArgs splits args at the last "--" separator, returning the flags and
@@ -130,9 +108,7 @@ func splitArgs(args []string) (flags, rest []string) {
 	if lastDash == -1 {
 		return args, nil
 	}
-	// If there are multiple --, take everything after the last one as rest
 	rest = args[lastDash+1:]
-	// flags is everything before the last --
 	flags = args[:lastDash]
 	return flags, rest
 }
@@ -140,25 +116,17 @@ func splitArgs(args []string) (flags, rest []string) {
 // add queues a single task onto a batch.
 func add(args []string) error {
 	flagArgs, command := splitArgs(args)
-	// Parse known flags manually to avoid issues with multiple "--" separators
-	var commandStr string
-	for i, arg := range flagArgs {
-		if arg == "--command" && i+1 < len(flagArgs) {
-			commandStr = flagArgs[i+1]
-		}
-	}
 	batchName := "default"
 	dirVal := ""
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
 	fs.String("batch", batchName, "batch name to queue onto (created if missing)")
 	fs.String("dir", dirVal, "working directory for the batch (default: current directory; only applies on batch creation)")
-	fs.String("command", commandStr, "full command as a string (alternative to specifying command after --)")
+	commandFlag := fs.String("command", "", "full command as a string (alternative to specifying command after --)")
 	if err := fs.Parse(flagArgs); err != nil {
 		return fmt.Errorf("parsing flags: %w", err)
 	}
-	// Use the explicit command if provided, otherwise use the args after --
-	if commandStr != "" {
-		command = strings.Fields(commandStr)
+	if *commandFlag != "" {
+		command = strings.Fields(*commandFlag)
 	} else if len(command) == 0 {
 		return errors.New("no command given; usage: forebay add [--batch NAME] -- CMD [ARGS...] or forebay add --command \"CMD [ARGS...]\"")
 	}
@@ -193,12 +161,15 @@ func batchQueued(args []string) error {
 	var globs, excludes multiFlag
 	fs.Var(&globs, "glob", "glob pattern relative to --dir, e.g. \"src/**/*.js\" (repeatable)")
 	fs.Var(&excludes, "exclude", "glob pattern to skip (repeatable; default: **/node_modules/**, **/.git/**)")
+	templateFlag := fs.String("command", "", "full command template as a string (alternative to specifying command after --)")
 	fs.Parse(flagArgs)
 	if len(globs) == 0 {
 		return errors.New("at least one --glob is required")
 	}
-	if len(template) == 0 {
-		return errors.New("no command template given after --")
+	if *templateFlag != "" {
+		template = strings.Fields(*templateFlag)
+	} else if len(template) == 0 {
+		return errors.New("no command template given; usage: forebay batch [--name NAME] --glob PATTERN [--glob ...] [--command \"CMD-TEMPLATE [ARGS...]\"] -- CMD-TEMPLATE [ARGS...]")
 	}
 	root, err := resolveWorkdir(*dir)
 	if err != nil {
@@ -240,7 +211,7 @@ func batchQueued(args []string) error {
 			return err
 		}
 	}
-	fmt.Printf("queued %d tasks on batch %q — run them with: forebay run --batch %s\n",
+	fmt.Printf("queued %d tasks on batch %q - run them with: forebay run --batch %s\n",
 		len(files), batch.Name, batch.Name)
 	return nil
 }
@@ -283,7 +254,7 @@ func status(args []string) error {
 		return err
 	}
 	if len(statuses) == 0 {
-		fmt.Println("queue is empty — add tasks with `forebay add` or `forebay batch`")
+		fmt.Println("queue is empty - add tasks with `forebay add` or `forebay batch`")
 		return nil
 	}
 	fmt.Printf("%-16s %-8s %8s %8s %8s %8s %9s\n",
@@ -332,15 +303,6 @@ func listTasks(args []string) error {
 		}
 
 		desc := strings.Join(t.Argv, " ")
-		if t.Kind == store.KindLLM {
-			spec, err := llm.ParseSpec(t.Payload)
-			if err != nil {
-				desc = "llm: (corrupt payload)"
-			} else {
-				desc = "llm: " + spec.User
-			}
-		}
-
 		fmt.Printf("%-8s %-16s %-9s %-5s %s\n",
 			t.ID, truncate(t.BatchName, 16), t.Status, exit,
 			truncate(desc, 80))
@@ -426,16 +388,6 @@ func reset(args []string) error {
 	return nil
 }
 
-// startMCPServer serves the forebay tools over the Model Context Protocol.
-func startMCPServer() error {
-	db, err := store.Open()
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	return mcpserver.Serve(context.Background(), db)
-}
-
 // resolveWorkdir returns the absolute path to an existing directory.
 func resolveWorkdir(dir string) (string, error) {
 	if dir == "" {
@@ -457,7 +409,7 @@ func resolveWorkdir(dir string) (string, error) {
 
 // summary handles the 'summary' subcommand for displaying overall queue statistics.
 func summary(args []string) error {
-	db, err := openDB()
+	db, err := store.Open()
 	if err != nil {
 		return err
 	}
@@ -467,10 +419,9 @@ func summary(args []string) error {
 		return err
 	}
 	if len(statuses) == 0 {
-		fmt.Println("no batches found — add tasks with `forebay add` or `forebay batch`")
+		fmt.Println("no batches found - add tasks with `forebay add` or `forebay batch`")
 		return nil
 	}
-	// Calculate totals across all batches
 	var totalPending, totalRunning, totalDone, totalFailed, totalCanceled int
 	for _, s := range statuses {
 		totalPending += s.Pending
@@ -485,7 +436,7 @@ func summary(args []string) error {
 	fmt.Printf("Running: %d\n", totalRunning)
 	fmt.Printf("Done:    %d\n", totalDone)
 	fmt.Printf("Failed:  %d\n", totalFailed)
-	fmt.Printf("Canceled:%d\n", totalCanceled)
+	fmt.Printf("Canceled: %d\n", totalCanceled)
 	return nil
 }
 

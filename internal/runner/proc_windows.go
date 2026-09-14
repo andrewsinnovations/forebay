@@ -27,8 +27,6 @@ type procTree struct {
 	pid uint32
 }
 
-// newProcTree associates the child process with a Job Object for
-// reliable termination of the entire process tree.
 func newProcTree(cmd *exec.Cmd) (*procTree, error) {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
@@ -73,7 +71,6 @@ func (t *procTree) Terminate() {
 // already empty is not an error worth surfacing.
 func (t *procTree) Kill() { _ = windows.TerminateJobObject(t.job, 1) }
 
-// Close releases the Job Object handle.
 func (t *procTree) Close() {
 	windows.CloseHandle(t.job)
 }

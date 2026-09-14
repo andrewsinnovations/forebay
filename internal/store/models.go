@@ -3,7 +3,6 @@ package store
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"time"
 )
 
 // Task statuses represent the lifecycle of a task.
@@ -25,14 +24,13 @@ type Batch struct {
 	Env       []string // captured at batch creation
 }
 
-// Task kinds.
+// Task kind.
 const (
 	KindExec = "exec"
-	KindLLM  = "llm"
 )
 
-// A Task is one queued unit of work: either an argv array to execute (Kind
-// is KindExec) or an LLM request payload (Kind is KindLLM).
+// A Task is one queued unit of work: an argv array to execute (Kind is
+// KindExec).
 type Task struct {
 	Seq             int64
 	ID              string
@@ -81,9 +79,4 @@ func NewID() string {
 		panic(err) // crypto/rand failure is unrecoverable
 	}
 	return hex.EncodeToString(b)
-}
-
-// now returns the current UTC timestamp in RFC3339 format.
-func now() string {
-	return time.Now().UTC().Format(time.RFC3339)
 }

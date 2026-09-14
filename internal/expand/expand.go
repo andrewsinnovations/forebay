@@ -37,9 +37,16 @@ func Files(root string, patterns, excludes []string) ([]string, error) {
 			return nil, fmt.Errorf("glob %q: %w: %v", pat, ErrPatternInvalid, err)
 		}
 		for _, m := range matches {
-			skip, err := excluded(m, excludes)
-			if err != nil {
-				return nil, fmt.Errorf("exclude check for %q: %w", m, err)
+			skip := false
+			for _, ex := range excludes {
+				ok, err := doublestar.Match(ex, m)
+				if err != nil {
+					return nil, fmt.Errorf("exclude check for %q: %w: %v", m, ErrPatternInvalid, err)
+				}
+				if ok {
+					skip = true
+					break
+				}
 			}
 			if skip {
 				continue
@@ -48,7 +55,7 @@ func Files(root string, patterns, excludes []string) ([]string, error) {
 			if runtime.GOOS == "windows" {
 				key = strings.ToLower(m)
 			}
-			if _, ok := seen[key]; !ok { // if NOT already seen
+			if _, ok := seen[key]; !ok {
 				seen[key] = m
 			}
 		}
@@ -59,21 +66,6 @@ func Files(root string, patterns, excludes []string) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
-}
-
-// excluded reports whether path matches any of the exclude patterns. A
-// malformed exclude pattern is reported with ErrPatternInvalid.
-func excluded(path string, excludes []string) (bool, error) {
-	for _, ex := range excludes {
-		ok, err := doublestar.Match(ex, path)
-		if err != nil {
-			return false, fmt.Errorf("exclude pattern %q: %w: %v", ex, ErrPatternInvalid, err)
-		}
-		if ok {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 // Render substitutes file placeholders into each element of the command

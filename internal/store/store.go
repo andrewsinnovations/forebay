@@ -1,5 +1,5 @@
 // Package store implements a SQLite-backed task queue shared between
-// the CLI, runner, and MCP server.
+// the CLI and runner.
 package store
 
 import (
@@ -12,14 +12,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// envHome names the environment variable that overrides the forebay home
-// directory.
 const envHome = "FOREBAY_HOME"
 
-// defaultBusyTimeout is how long SQLite waits for a write lock before failing.
 const defaultBusyTimeout = 5000
 
-// schema creates the database tables.
 const schema = `
 CREATE TABLE IF NOT EXISTS batches (
 	id         TEXT PRIMARY KEY,
@@ -91,23 +87,27 @@ func Open() (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", dbPath, err)
 	}
-	if err := initSchema(db); err != nil {
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+	have, err := columns(db)
+	if err != nil {
 		db.Close()
 		return nil, err
+	}
+	for col, def := range addedColumns {
+		if have[col] {
+			continue
+		}
+		if _, err := db.Exec("ALTER TABLE tasks ADD COLUMN " + col + " " + def); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("add column %q: %w", col, err)
+		}
 	}
 	return &DB{DB: db, dir: dir}, nil
 }
 
-// initSchema creates the tables and applies schema migrations for databases
-// created by older versions.
-func initSchema(db *sql.DB) error {
-	if _, err := db.Exec(schema); err != nil {
-		return fmt.Errorf("apply schema: %w", err)
-	}
-	return migrate(db)
-}
-
-// columns lists the existing column names of the tasks table.
 func columns(db *sql.DB) (map[string]bool, error) {
 	rows, err := db.Query(`PRAGMA table_info(tasks)`)
 	if err != nil {
@@ -137,25 +137,6 @@ var addedColumns = map[string]string{
 	"result":  `TEXT`,
 }
 
-// migrate adds columns introduced after the initial schema.
-func migrate(db *sql.DB) error {
-	have, err := columns(db)
-	if err != nil {
-		return err
-	}
-	for col, def := range addedColumns {
-		if have[col] { // if column already present
-			continue
-		}
-		if _, err := db.Exec("ALTER TABLE tasks ADD COLUMN " + col + " " + def); err != nil {
-			return fmt.Errorf("add column %q: %w", col, err)
-		}
-	}
-	return nil
-}
-
-// Home returns the forebay home directory backing this database.
 func (d *DB) Home() string { return d.dir }
 
-// LogsDir returns the directory task logs are written under.
 func (d *DB) LogsDir() string { return filepath.Join(d.dir, "logs") }

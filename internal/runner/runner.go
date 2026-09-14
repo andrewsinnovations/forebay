@@ -1,6 +1,6 @@
 // Package runner drains the forebay queue: it claims tasks atomically,
 // executes them as direct process spawns (never through a shell), heartbeats
-// while they run, and kills whole process trees on cancellation — process
+// while they run, and kills whole process trees on cancellation - process
 // groups on Unix, Job Objects on Windows (see proc_*.go).
 package runner
 
@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,9 @@ const (
 	// maxArgLen is the length beyond which a single command argument is
 	// elided in status output.
 	maxArgLen = 60
+	// maxResultEnv is the environment variable name for the maximum result
+	// bytes to capture from a task log.
+	maxResultEnv = "FOREBAY_MAX_RESULT_BYTES"
 )
 
 // Options configures a call to Run. Zero values select the defaults noted per
@@ -75,7 +79,11 @@ func Run(ctx context.Context, db *store.DB, opts Options) error {
 
 	// One identity is shared by every worker so a task claimed by this
 	// process can be attributed to it in the database.
-	id := newRunnerID()
+	host, err := os.Hostname()
+	if err != nil {
+		host = "unknown"
+	}
+	id := fmt.Sprintf("%s-%d", host, os.Getpid())
 	var wg sync.WaitGroup
 	for range opts.Workers {
 		wg.Add(1)
@@ -89,15 +97,6 @@ func Run(ctx context.Context, db *store.DB, opts Options) error {
 		fmt.Println("interrupted: running tasks were killed and requeued")
 	}
 	return nil
-}
-
-// newRunnerID returns an identifier unique to this forebay process.
-func newRunnerID() string {
-	host, err := os.Hostname()
-	if err != nil { // fall back to the PID alone, which is still process-unique
-		host = "unknown"
-	}
-	return fmt.Sprintf("%s-%d", host, os.Getpid())
 }
 
 // work claims and executes tasks until ctx is canceled, or until the queue is
@@ -128,11 +127,7 @@ func work(ctx context.Context, db *store.DB, runnerID string, opts Options) {
 		// Tee only a solo worker's output: with several workers the lines
 		// interleave into noise, and the log file holds everything anyway.
 		tee := opts.Workers == 1
-		if task.Kind == store.KindLLM {
-			runLLMTask(ctx, db, task, tee)
-		} else {
-			runTask(ctx, db, task, tee)
-		}
+		runTask(ctx, db, task, tee)
 	}
 }
 
@@ -165,7 +160,15 @@ func runTask(ctx context.Context, db *store.DB, task *store.Task, tee bool) {
 	cmd.Stdout, cmd.Stderr, cmd.Stdin = out, out, nil
 	setupProcAttr(cmd)
 
-	fmt.Printf("[%s/%s] start: %s\n", batch.Name, task.ID, formatArgv(task.Argv))
+	parts := make([]string, len(task.Argv))
+	for i, a := range task.Argv {
+		if len(a) <= maxArgLen {
+			parts[i] = a
+		} else {
+			parts[i] = a[:maxArgLen-3] + "..."
+		}
+	}
+	fmt.Printf("[%s/%s] start: %s\n", batch.Name, task.ID, strings.Join(parts, " "))
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
 		fail(db, task, fmt.Errorf("spawn %q: %w", task.Argv[0], err))
@@ -206,7 +209,7 @@ func runTask(ctx context.Context, db *store.DB, task *store.Task, tee bool) {
 			}
 			settle(db, task, status, exitCode, errMsg, logPath)
 			fmt.Printf("[%s/%s] %s (exit %d, %s)\n",
-				batch.Name, task.ID, status, exitCode, roundSince(start))
+				batch.Name, task.ID, status, exitCode, time.Since(start).Round(time.Second).String())
 			return
 
 		case <-ticker.C:
@@ -243,7 +246,41 @@ func heartbeat(db *store.DB, taskID string) (cancelRequested bool, err error) {
 
 // settle records a terminal status for task and saves its log as the result.
 func settle(db *store.DB, task *store.Task, status string, exitCode int, errMsg, logPath string) {
-	if err := db.MarkFinished(task.ID, status, exitCode, errMsg, captureResult(logPath, resultLimit())); err != nil {
+	var limit int64
+	if v := os.Getenv(maxResultEnv); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			fmt.Fprintf(os.Stderr, "warning: ignoring invalid %s=%q\n", maxResultEnv, v)
+		} else {
+			limit = n
+		}
+	}
+
+	var result string
+	if logPath != "" {
+		if f, err := os.Open(logPath); err == nil {
+			defer f.Close()
+			if info, err := f.Stat(); err == nil {
+				size := info.Size()
+				if limit <= 0 || size <= limit {
+					if data, err := io.ReadAll(f); err == nil {
+						result = string(data)
+					}
+				} else {
+					head := make([]byte, limit/2)
+					if _, err := io.ReadFull(f, head); err == nil {
+						tail := make([]byte, limit-int64(len(head)))
+						if _, err := f.ReadAt(tail, size-int64(len(tail))); err == nil {
+							result = fmt.Sprintf("%s\n... [%d bytes omitted; full output: %s] ...\n%s",
+								head, size-limit, logPath, tail)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if err := db.MarkFinished(task.ID, status, exitCode, errMsg, result); err != nil {
 		fmt.Fprintf(os.Stderr, "task %s: %v\n", task.ID, err)
 	}
 }
@@ -302,7 +339,6 @@ func signalTree(cmd *exec.Cmd, tree *procTree, soft bool) {
 	case tree != nil:
 		tree.Kill()
 	case cmd.Process == nil:
-		// The process never started; cmd.Wait has nothing to reap.
 	case soft:
 		// Best effort: a task that ignores SIGINT is killed after the grace
 		// period.
@@ -310,26 +346,4 @@ func signalTree(cmd *exec.Cmd, tree *procTree, soft bool) {
 	default:
 		_ = cmd.Process.Kill()
 	}
-}
-
-// formatArgv renders an argument vector for display, eliding long arguments.
-func formatArgv(argv []string) string {
-	parts := make([]string, len(argv))
-	for i, a := range argv {
-		parts[i] = shorten(a, maxArgLen)
-	}
-	return strings.Join(parts, " ")
-}
-
-// shorten returns s, elided with a trailing ellipsis if longer than n.
-func shorten(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n-3] + "..."
-}
-
-// roundSince reports the elapsed time since start, rounded for display.
-func roundSince(start time.Time) string {
-	return time.Since(start).Round(time.Second).String()
 }

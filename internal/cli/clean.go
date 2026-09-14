@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"errors"
@@ -36,7 +36,7 @@ func clean(args []string) error {
 	}
 	removed := 0
 	for _, p := range logPaths {
-		if err := os.Remove(p); err == nil { // if NO error
+		if err := os.Remove(p); err == nil {
 			removed++
 		}
 	}

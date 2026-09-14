@@ -45,7 +45,7 @@ func (d *DB) EnsureBatch(name, workdir string, env []string) (Batch, error) {
 	}
 	_, err = d.Exec(`INSERT INTO batches (id, name, created_at, workdir, env)
 		VALUES (?, ?, ?, ?, ?) ON CONFLICT(name) DO NOTHING`,
-		NewID(), name, now(), workdir, string(envJSON))
+		NewID(), name, time.Now().UTC().Format(time.RFC3339), workdir, string(envJSON))
 	if err != nil {
 		return Batch{}, fmt.Errorf("ensure batch %q: %w", name, err)
 	}
@@ -89,24 +89,13 @@ func (d *DB) AddTask(batchID string, argv []string) (string, error) {
 	return id, nil
 }
 
-// AddLLMTask queues an LLM call with the given payload and returns the new
-// task ID.
-func (d *DB) AddLLMTask(batchID, payload string) (string, error) {
-	id := NewID()
-	if _, err := d.Exec(`INSERT INTO tasks (id, batch_id, kind, argv, payload)
-		VALUES (?, ?, 'llm', '[]', ?)`, id, batchID, payload); err != nil {
-		return "", fmt.Errorf("queue llm task: %w", err)
-	}
-	return id, nil
-}
-
 // Claim atomically takes the oldest pending task for the given runner,
 // optionally filtered by batch name or ID. When the queue holds no pending
 // work, Claim returns an error wrapping ErrNoTask.
 func (d *DB) Claim(runnerID, batch string) (*Task, error) {
 	q := `UPDATE tasks SET status = 'running', runner = ?, claimed_at = ?, heartbeat_at = ?
 		WHERE seq = (SELECT seq FROM tasks WHERE status = 'pending'`
-	args := []any{runnerID, now(), now()}
+	args := []any{runnerID, time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339)}
 	if batch != "" {
 		q += ` AND batch_id IN (SELECT id FROM batches WHERE name = ? OR id = ?)`
 		args = append(args, batch, batch)
@@ -136,7 +125,7 @@ func (d *DB) Claim(runnerID, batch string) (*Task, error) {
 // the returned error wraps ErrNotRunning.
 func (d *DB) Touch(taskID string) (cancelRequested bool, err error) {
 	row := d.QueryRow(`UPDATE tasks SET heartbeat_at = ? WHERE id = ? AND status = 'running'
-		RETURNING cancel_requested`, now(), taskID)
+		RETURNING cancel_requested`, time.Now().UTC().Format(time.RFC3339), taskID)
 	var cancel int
 	if err := row.Scan(&cancel); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -150,18 +139,17 @@ func (d *DB) Touch(taskID string) (cancelRequested bool, err error) {
 // MarkStarted records the exec start time and log location.
 func (d *DB) MarkStarted(taskID, logPath string) error {
 	if _, err := d.Exec(`UPDATE tasks SET started_at = ?, log_path = ? WHERE id = ?`,
-		now(), logPath, taskID); err != nil {
+		time.Now().UTC().Format(time.RFC3339), logPath, taskID); err != nil {
 		return fmt.Errorf("mark task %s started: %w", taskID, err)
 	}
 	return nil
 }
 
 // MarkFinished settles a task into done, failed, or canceled. result is the
-// task's saved output: the model reply for LLM tasks, the captured
-// stdout and stderr for exec tasks.
+// captured stdout and stderr for the task.
 func (d *DB) MarkFinished(taskID, status string, exitCode int, errMsg, result string) error {
 	if _, err := d.Exec(`UPDATE tasks SET status = ?, finished_at = ?, exit_code = ?, error = ?,
-		result = ? WHERE id = ?`, status, now(), exitCode, errMsg, result, taskID); err != nil {
+		result = ? WHERE id = ?`, status, time.Now().UTC().Format(time.RFC3339), exitCode, errMsg, result, taskID); err != nil {
 		return fmt.Errorf("mark task %s finished: %w", taskID, err)
 	}
 	return nil
@@ -389,7 +377,7 @@ func (d *DB) Results(f ResultFilter) ([]Task, error) {
 	}
 	if f.Contains != "" {
 		q += ` AND t.result LIKE ? ESCAPE '\'`
-		args = append(args, "%"+escapeLike(f.Contains)+"%")
+		args = append(args, "%"+strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(f.Contains)+"%")
 	}
 	q += ` ORDER BY t.seq`
 	if f.Limit > 0 {
@@ -412,13 +400,6 @@ func (d *DB) Results(f ResultFilter) ([]Task, error) {
 	return out, rows.Err()
 }
 
-// escapeLike neutralizes SQL LIKE wildcards, paired with ESCAPE '\'.
-func escapeLike(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-	return r.Replace(s)
-}
-
-// taskSelect is the base query for fetching tasks with batch names.
 const taskSelect = `SELECT t.seq, t.id, t.batch_id, b.name, t.kind, t.argv,
 	COALESCE(t.payload, ''), COALESCE(t.result, ''), t.status,
 	COALESCE(t.runner, ''), COALESCE(t.claimed_at, ''), COALESCE(t.heartbeat_at, ''),
